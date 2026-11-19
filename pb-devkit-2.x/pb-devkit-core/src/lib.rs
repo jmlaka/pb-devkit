@@ -14,3 +14,4 @@ pub mod dw;
 pub mod decompile;
 pub mod report;
 pub mod types;
+pub mod object;

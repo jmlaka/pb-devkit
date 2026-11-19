@@ -50,18 +50,18 @@ pub const PB_OBJECT_TYPE_12_5: &[(&str, u8)] = &[
 
 // Source extension to type mapping (PB12+ Unicode)
 pub const SOURCE_EXT_MAP: &[(&str, u8)] = &[
-    (".srw", 2),   // WINDOW
-    (".srd", 1),   // DATAWINDOW
-    (".srm", 3),   // MENU
-    (".srf", 4),   // FUNCTION
-    (".srs", 5),   // STRUCTURE
-    (".sru", 6),   // USEROBJECT
-    (".srq", 7),   // QUERY
-    (".srp", 8),   // PIPELINE
-    (".srj", 9),   // PROJECT
-    (".srx", 10),  // PROXY
-    (".sre", 12),  // EMBEDDED_SQL
-    (".sra", 0),   // APPLICATION
+    (".srw", 2),  // WINDOW
+    (".srd", 1),  // DATAWINDOW
+    (".srm", 3),  // MENU
+    (".srf", 4),  // FUNCTION
+    (".srs", 5),  // STRUCTURE
+    (".sru", 6),  // USEROBJECT
+    (".srq", 7),  // QUERY
+    (".srp", 8),  // PIPELINE
+    (".srj", 9),  // PROJECT
+    (".srx", 10), // PROXY
+    (".sre", 12), // EMBEDDED_SQL
+    (".sra", 0),  // APPLICATION
 ];
 
 // Block sizes
@@ -71,11 +71,11 @@ const ENTRIES_PER_NODE: usize = 40; // Match PblWriter
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PblVersion {
-    Pb5,    // PB5-PB9 (ANSI)
-    Pb10,   // PB10-PB11 (Unicode)
-    Pb12,   // PB12-PB12.5 (Unicode)
-    Pb125,  // PB 12.5+ (Unicode, new object types)
-    Pb126,  // PB 12.6+ (Unicode, latest)
+    Pb5,   // PB5-PB9 (ANSI)
+    Pb10,  // PB10-PB11 (Unicode)
+    Pb12,  // PB12-PB12.5 (Unicode)
+    Pb125, // PB 12.5+ (Unicode, new object types)
+    Pb126, // PB 12.6+ (Unicode, latest)
     Unknown,
 }
 
@@ -135,7 +135,9 @@ impl PblVersion {
         for chunk in version_bytes.chunks(2) {
             if chunk.len() == 2 {
                 let ch = u16::from_le_bytes([chunk[0], chunk[1]]);
-                if ch == 0 { break; }
+                if ch == 0 {
+                    break;
+                }
                 if let Some(c) = char::from_u32(ch as u32) {
                     version_str.push(c);
                 }
@@ -253,7 +255,7 @@ impl PblParser {
                         Ok(info.resources[0].offset)
                     } else {
                         Err(PblError::ParseError(
-                            "No embedded PBL found in EXE".to_string()
+                            "No embedded PBL found in EXE".to_string(),
                         ))
                     }
                 }
@@ -284,13 +286,16 @@ impl PblParser {
 
         // Use enhanced version detection
         let (detected_version, is_valid) = PblVersion::detect_from_header(&header);
-        
+
         if !is_valid {
             return Err(PblError::InvalidFormat);
         }
 
         self.pb_version = detected_version;
-        self.is_unicode = matches!(detected_version, PblVersion::Pb10 | PblVersion::Pb12 | PblVersion::Pb125 | PblVersion::Pb126);
+        self.is_unicode = matches!(
+            detected_version,
+            PblVersion::Pb10 | PblVersion::Pb12 | PblVersion::Pb125 | PblVersion::Pb126
+        );
         self.header_size = if self.is_unicode { 1024 } else { 512 };
 
         Ok(())
@@ -300,78 +305,60 @@ impl PblParser {
         let mut file = File::open(&self.path)?;
         let file_size = file.metadata()?.len();
 
-        let base = self.pbl_data_offset;
+        let first_node = self.pbl_data_offset + self.header_size + BLOCK_SIZE;
 
-        // Step 1: Read total entry count from header at offset base + header_size - 8 (u32 LE)
-        let total_entries_offset = base + self.header_size - 8;
-        if total_entries_offset + 4 > file_size {
-            return Err(PblError::InvalidFormat);
-        }
-        file.seek(SeekFrom::Start(total_entries_offset))?;
-        let mut te_buf = [0u8; 4];
-        file.read_exact(&mut te_buf)?;
-        let total_entries = u32::from_le_bytes(te_buf) as usize;
-
-        if total_entries == 0 {
+        if first_node + NODE_BLOCK_SIZE > file_size {
             return Ok(());
         }
 
-        // Step 2: Calculate node_count = ceil(total_entries / ENTRIES_PER_NODE)
-        let node_count = (total_entries + ENTRIES_PER_NODE - 1) / ENTRIES_PER_NODE;
-
-        // Step 3: For each node, read NOD* block and parse ENT* entries inside it
-        for node_idx in 0..node_count {
-            let nod_offset = base + self.header_size + BLOCK_SIZE + node_idx as u64 * NODE_BLOCK_SIZE;
-
-            if nod_offset + NODE_BLOCK_SIZE > file_size {
-                break;
-            }
-
+        // Scan 512-byte boundaries for actual NOD* blocks.
+        for nod_offset in (first_node..=file_size - NODE_BLOCK_SIZE).step_by(BLOCK_SIZE as usize) {
             file.seek(SeekFrom::Start(nod_offset))?;
-            let mut nod_block = vec![0u8; NODE_BLOCK_SIZE as usize];
-            file.read_exact(&mut nod_block)?;
 
-            // Verify NOD* magic at offset 0
-            if &nod_block[0..4] != b"NOD*" {
+            let mut magic = [0u8; 4];
+            file.read_exact(&mut magic)?;
+
+            if &magic != b"NOD*" {
                 continue;
             }
 
-            // Read nod_entry_count from offset 20 (u16 LE)
+            file.seek(SeekFrom::Start(nod_offset))?;
+
+            let mut nod_block = vec![0u8; NODE_BLOCK_SIZE as usize];
+
+            file.read_exact(&mut nod_block)?;
+
             let nod_entry_count = u16::from_le_bytes([nod_block[20], nod_block[21]]) as usize;
 
-            // Start at pos = 32 (ENT* entries begin at offset 32 within NOD* block)
             let mut pos = 32usize;
 
             for _ in 0..nod_entry_count {
-                if pos + 4 > nod_block.len() {
+                let ent_hdr_size = if self.is_unicode { 28usize } else { 24usize };
+
+                if pos + ent_hdr_size > nod_block.len() {
                     break;
                 }
 
-                // Verify ENT* at current position
                 if &nod_block[pos..pos + 4] != b"ENT*" {
                     break;
                 }
 
-                // Parse the ENT* entry
-                if let Some(entry) = self.parse_ent_block(&nod_block[pos..], nod_offset + pos as u64) {
-                    self.entries.push(entry);
-                }
-
-                // Advance pos by ent_hdr_size + name_len
-                let (ent_hdr_size, name_len_offset) = if self.is_unicode {
-                    (28usize, pos + 26)
-                } else {
-                    (24usize, pos + 22)
-                };
-
-                if name_len_offset + 2 > nod_block.len() {
-                    break;
-                }
+                let name_len_offset = if self.is_unicode { pos + 26 } else { pos + 22 };
 
                 let name_len = u16::from_le_bytes([
                     nod_block[name_len_offset],
                     nod_block[name_len_offset + 1],
                 ]) as usize;
+
+                if name_len == 0 || pos + ent_hdr_size + name_len > nod_block.len() {
+                    break;
+                }
+
+                if let Some(entry) =
+                    self.parse_ent_block(&nod_block[pos..], nod_offset + pos as u64)
+                {
+                    self.entries.push(entry);
+                }
 
                 pos += ent_hdr_size + name_len;
             }
@@ -395,10 +382,12 @@ impl PblParser {
             return None;
         }
 
-        let data_offset_raw = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as u64;
-        // data_offset_raw is relative to the PBL data start; add pbl_data_offset for EXE files
-        let data_offset = self.pbl_data_offset + data_offset_raw;
-        let data_size = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as u64;
+        let data_offset_raw = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as u64;
+
+        //let data_offset = self.pbl_data_offset + data_offset_raw;
+        let data_offset = data_offset_raw;
+
+        let data_size = u32::from_le_bytes([data[16], data[17], data[18], data[19]]) as u64;
 
         let name_start = if self.is_unicode { 28 } else { 24 };
         let name_end = name_start + name_len as usize;
@@ -412,7 +401,9 @@ impl PblParser {
             let mut decoded = Vec::new();
             for j in (0..name_bytes.len().saturating_sub(1)).step_by(2) {
                 let ch = u16::from_le_bytes([name_bytes[j], name_bytes[j + 1]]);
-                if ch == 0 { break; }
+                if ch == 0 {
+                    break;
+                }
                 if let Some(c) = char::from_u32(ch as u32) {
                     decoded.push(c);
                 }
@@ -421,7 +412,9 @@ impl PblParser {
         } else {
             let mut decoded = Vec::new();
             for &b in name_bytes {
-                if b == 0 { break; }
+                if b == 0 {
+                    break;
+                }
                 decoded.push(b);
             }
             String::from_utf8_lossy(&decoded).into_owned()
@@ -441,9 +434,13 @@ impl PblParser {
 
         // Version string
         let version = if self.is_unicode {
-            String::from_utf8_lossy(&data[4..12]).trim_end_matches('\0').to_string()
+            String::from_utf8_lossy(&data[4..12])
+                .trim_end_matches('\0')
+                .to_string()
         } else {
-            String::from_utf8_lossy(&data[4..8]).trim_end_matches('\0').to_string()
+            String::from_utf8_lossy(&data[4..8])
+                .trim_end_matches('\0')
+                .to_string()
         };
 
         let (entry_type, is_source) = Self::detect_type_from_name(&name);
@@ -470,7 +467,9 @@ impl PblParser {
                 return (*t, true);
             }
         }
-        let compiled_exts = [".win", ".dwo", ".prp", ".udo", ".fun", ".str", ".apl", ".men", ".pra"];
+        let compiled_exts = [
+            ".win", ".dwo", ".prp", ".udo", ".fun", ".str", ".apl", ".men", ".pra",
+        ];
         for ext in compiled_exts.iter() {
             if lower.ends_with(ext) {
                 return (11, false); // BINARY
@@ -504,47 +503,85 @@ impl PblParser {
             (".pra", "project"),
         ];
         for (ext, _name) in &compiled_types {
-            if t == 11 && *ext == ".win" { return "window".to_string(); }
+            if t == 11 && *ext == ".win" {
+                return "window".to_string();
+            }
         }
         "unknown".to_string()
     }
 
     // ── Chunk Chain Parsing ──
 
-    /// Parse DAT* chunk chain to get raw data
-    pub fn parse_chunk_chain(&self, start_offset: u64, max_size: u64) -> Result<Vec<u8>, PblError> {
+    pub fn parse_chunk_chain(
+        &self,
+        start_offset: u64,
+        expected_size: u64,
+    ) -> Result<Vec<u8>, PblError> {
+        use std::collections::HashSet;
+
         let mut file = File::open(&self.path)?;
-        let mut data = Vec::new();
-        let mut current_offset = start_offset;
-        let mut remaining = max_size;
+        let file_size = file.metadata()?.len();
 
-        while remaining > 0 {
-            let mut block = [0u8; 512];
-            file.seek(SeekFrom::Start(current_offset))?;
-            let bytes_read = file.read(&mut block)?;
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        let mut offset = start_offset;
 
-            if bytes_read < 4 || &block[0..4] != b"DAT*" {
-                break;
+        while offset != 0 {
+            // Detect cycles and invalid block addresses.
+            if !visited.insert(offset)
+                || offset % 512 != 0
+                || offset.checked_add(512).map_or(true, |end| end > file_size)
+            {
+                return Err(PblError::InvalidFormat);
             }
 
-            let chunk_size = (remaining as usize).min(508);
-            data.extend_from_slice(&block[4..4 + chunk_size]);
-            remaining -= chunk_size as u64;
-            current_offset += 512;
+            file.seek(SeekFrom::Start(offset))?;
+
+            let mut block = [0u8; 512];
+            file.read_exact(&mut block)?;
+
+            if &block[0..4] != b"DAT*" {
+                return Err(PblError::InvalidFormat);
+            }
+
+            let next_offset = u32::from_le_bytes([block[4], block[5], block[6], block[7]]) as u64;
+
+            let length = u16::from_le_bytes([block[8], block[9]]) as usize;
+
+            if length > 502 || (result.len() as u64) + (length as u64) > expected_size {
+                return Err(PblError::InvalidFormat);
+            }
+
+            result.extend_from_slice(&block[10..10 + length]);
+
+            offset = next_offset;
         }
 
-        Ok(data)
+        if result.len() as u64 != expected_size {
+            return Err(PblError::InvalidFormat);
+        }
+
+        Ok(result)
     }
 
-    /// Parse a single DAT* chunk
+    /// Parse one 512-byte DAT* block.
+    /// Returns (next_block_offset, payload).
     pub fn parse_dat_chunk(data: &[u8]) -> Option<(u32, Vec<u8>)> {
-        if data.len() < 8 || &data[0..4] != b"DAT*" {
+        if data.len() != 512 || &data[0..4] != b"DAT*" {
             return None;
         }
 
-        let size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-        let chunk_data = data[8..].to_vec();
-        Some((size, chunk_data))
+        let next_offset = u32::from_le_bytes(data[4..8].try_into().ok()?);
+
+        let payload_len = u16::from_le_bytes(data[8..10].try_into().ok()?) as usize;
+
+        if payload_len > 502 {
+            return None;
+        }
+
+        let payload = data[10..10 + payload_len].to_vec();
+
+        Some((next_offset, payload))
     }
 
     /// Get index block range for B-tree
@@ -593,7 +630,9 @@ impl PblParser {
 
     /// Export a single entry's source code
     pub fn export_entry(&self, name: &str) -> Result<String, PblError> {
-        let entry = self.entries.iter()
+        let entry = self
+            .entries
+            .iter()
             .find(|e| e.name.to_lowercase() == name.to_lowercase())
             .ok_or_else(|| PblError::NotFound(name.to_string()))?;
 
@@ -624,7 +663,9 @@ impl PblParser {
             let mut decoded = String::new();
             for chunk in source_data.chunks_exact(2) {
                 let ch = u16::from_le_bytes([chunk[0], chunk[1]]);
-                if ch == 0 { break; }
+                if ch == 0 {
+                    break;
+                }
                 if let Some(c) = char::from_u32(ch as u32) {
                     decoded.push(c);
                 }
@@ -698,8 +739,10 @@ pub fn format_timestamp(secs: u32) -> String {
     let hours = r / 3600;
     let minutes = (r % 3600) / 60;
     let seconds = r % 60;
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        year, month, day, hours, minutes, seconds)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        year, month, day, hours, minutes, seconds
+    )
 }
 
 fn is_leap_year(year: i64) -> bool {
@@ -722,7 +765,10 @@ mod tests {
     fn build_ansi_pbl(entry_name: &str) -> Vec<u8> {
         let mut buf: Vec<u8> = vec![0u8; 512];
         // HDR* magic
-        buf[0] = b'H'; buf[1] = b'D'; buf[2] = b'R'; buf[3] = b'*';
+        buf[0] = b'H';
+        buf[1] = b'D';
+        buf[2] = b'R';
+        buf[3] = b'*';
         // ANSI version string "PB9.0"
         let version: &[u8] = b"PB9.0";
         buf[4..9].copy_from_slice(version);
@@ -740,9 +786,13 @@ mod tests {
         // NOD* node block at offset 1024 (header_size + BLOCK_SIZE)
         let mut nod_block = vec![0u8; NODE_BLOCK_SIZE as usize];
         // NOD* magic at offset 0
-        nod_block[0] = b'N'; nod_block[1] = b'O'; nod_block[2] = b'D'; nod_block[3] = b'*';
+        nod_block[0] = b'N';
+        nod_block[1] = b'O';
+        nod_block[2] = b'D';
+        nod_block[3] = b'*';
         // nod_entry_count = 1 at offset 20 (u16 LE)
-        nod_block[20] = 1; nod_block[21] = 0;
+        nod_block[20] = 1;
+        nod_block[21] = 0;
 
         // ENT* entry at offset 32 within NOD* block
         let ent_start = 32usize;
@@ -752,8 +802,8 @@ mod tests {
         nod_block[ent_start + 3] = b'*';
         // data_offset = 0x2000 (8192), u32 LE at offset 8
         let data_off: u32 = 0x2000;
-        nod_block[ent_start + 8]  = (data_off & 0xFF) as u8;
-        nod_block[ent_start + 9]  = ((data_off >> 8) & 0xFF) as u8;
+        nod_block[ent_start + 8] = (data_off & 0xFF) as u8;
+        nod_block[ent_start + 9] = ((data_off >> 8) & 0xFF) as u8;
         nod_block[ent_start + 10] = ((data_off >> 16) & 0xFF) as u8;
         nod_block[ent_start + 11] = ((data_off >> 24) & 0xFF) as u8;
         // data_size = 512, u32 LE at offset 12
@@ -798,7 +848,10 @@ mod tests {
     fn build_unicode_pbl(version_str: &str) -> Vec<u8> {
         let mut buf: Vec<u8> = vec![0u8; 1024];
         // HDR* magic
-        buf[0] = b'H'; buf[1] = b'D'; buf[2] = b'R'; buf[3] = b'*';
+        buf[0] = b'H';
+        buf[1] = b'D';
+        buf[2] = b'R';
+        buf[3] = b'*';
         // Unicode version string (little-endian UTF-16)
         let s = version_str.as_bytes();
         for (i, &b) in s.iter().enumerate() {
@@ -821,9 +874,13 @@ mod tests {
         // NOD* node block at offset 1536 (header_size + BLOCK_SIZE)
         let mut nod_block = vec![0u8; NODE_BLOCK_SIZE as usize];
         // NOD* magic at offset 0
-        nod_block[0] = b'N'; nod_block[1] = b'O'; nod_block[2] = b'D'; nod_block[3] = b'*';
+        nod_block[0] = b'N';
+        nod_block[1] = b'O';
+        nod_block[2] = b'D';
+        nod_block[3] = b'*';
         // nod_entry_count = 1 at offset 20 (u16 LE)
-        nod_block[20] = 1; nod_block[21] = 0;
+        nod_block[20] = 1;
+        nod_block[21] = 0;
 
         // ENT* entry at offset 32 within NOD* block
         let ent_start = 32usize;
@@ -833,8 +890,8 @@ mod tests {
         nod_block[ent_start + 3] = b'*';
         // data_offset = 0x2000 (8192), u32 LE at offset 8
         let data_off: u32 = 0x2000;
-        nod_block[ent_start + 8]  = (data_off & 0xFF) as u8;
-        nod_block[ent_start + 9]  = ((data_off >> 8) & 0xFF) as u8;
+        nod_block[ent_start + 8] = (data_off & 0xFF) as u8;
+        nod_block[ent_start + 9] = ((data_off >> 8) & 0xFF) as u8;
         nod_block[ent_start + 10] = ((data_off >> 16) & 0xFF) as u8;
         nod_block[ent_start + 11] = ((data_off >> 24) & 0xFF) as u8;
         // data_size = 512, u32 LE at offset 12
@@ -896,10 +953,14 @@ mod tests {
         let mut header = vec![0u8; 24];
         header[..4].copy_from_slice(b"HDR*");
         // "PB10" in LE UTF-16
-        header[4] = b'P'; header[5] = 0x00;
-        header[6] = b'B'; header[7] = 0x00;
-        header[8] = b'1'; header[9] = 0x00;
-        header[10] = b'0'; header[11] = 0x00;
+        header[4] = b'P';
+        header[5] = 0x00;
+        header[6] = b'B';
+        header[7] = 0x00;
+        header[8] = b'1';
+        header[9] = 0x00;
+        header[10] = b'0';
+        header[11] = 0x00;
         let (ver, ok) = PblVersion::detect_from_header(&header);
         assert!(ok);
         assert_eq!(ver, PblVersion::Pb10);
@@ -909,10 +970,14 @@ mod tests {
     fn test_detect_unicode_pb12() {
         let mut header = vec![0u8; 24];
         header[..4].copy_from_slice(b"HDR*");
-        header[4] = b'P'; header[5] = 0x00;
-        header[6] = b'B'; header[7] = 0x00;
-        header[8] = b'1'; header[9] = 0x00;
-        header[10] = b'2'; header[11] = 0x00;
+        header[4] = b'P';
+        header[5] = 0x00;
+        header[6] = b'B';
+        header[7] = 0x00;
+        header[8] = b'1';
+        header[9] = 0x00;
+        header[10] = b'2';
+        header[11] = 0x00;
         let (ver, ok) = PblVersion::detect_from_header(&header);
         assert!(ok);
         assert_eq!(ver, PblVersion::Pb12);
@@ -1014,13 +1079,13 @@ mod tests {
 
     #[test]
     fn test_detect_source_types() {
-        assert_eq!(PblParser::detect_type_from_name("w_main.srw"), (2, true));   // window
-        assert_eq!(PblParser::detect_type_from_name("d_emp.srd"), (1, true));     // datawindow
-        assert_eq!(PblParser::detect_type_from_name("m_frame.srm"), (3, true));   // menu
-        assert_eq!(PblParser::detect_type_from_name("f_calc.srf"), (4, true));    // function
-        assert_eq!(PblParser::detect_type_from_name("s_emp.srs"), (5, true));     // structure
-        assert_eq!(PblParser::detect_type_from_name("uo_my.sru"), (6, true));     // userobject
-        assert_eq!(PblParser::detect_type_from_name("app.sra"), (0, true));       // application
+        assert_eq!(PblParser::detect_type_from_name("w_main.srw"), (2, true)); // window
+        assert_eq!(PblParser::detect_type_from_name("d_emp.srd"), (1, true)); // datawindow
+        assert_eq!(PblParser::detect_type_from_name("m_frame.srm"), (3, true)); // menu
+        assert_eq!(PblParser::detect_type_from_name("f_calc.srf"), (4, true)); // function
+        assert_eq!(PblParser::detect_type_from_name("s_emp.srs"), (5, true)); // structure
+        assert_eq!(PblParser::detect_type_from_name("uo_my.sru"), (6, true)); // userobject
+        assert_eq!(PblParser::detect_type_from_name("app.sra"), (0, true)); // application
     }
 
     #[test]
@@ -1117,7 +1182,9 @@ mod tests {
 
         let parser = PblParser::new(&path).unwrap();
         let out_dir = tmp.path().parent().unwrap().join("export_pbl_test");
-        let count = parser.export_pbl(out_dir.to_string_lossy().as_ref(), false).unwrap();
+        let count = parser
+            .export_pbl(out_dir.to_string_lossy().as_ref(), false)
+            .unwrap();
         assert_eq!(count, 1);
 
         // Verify exported file
