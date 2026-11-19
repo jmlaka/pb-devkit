@@ -149,3 +149,114 @@ impl PbObjectMetadata {
     }
 }
 
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PbTypeReference {
+    pub name: String,
+    pub type_id: u16,
+    pub descriptor_index: usize,
+    pub tag_a: u16,
+    pub tag_b: u16,
+    pub flags: u16,
+}
+
+impl PbObjectMetadata {
+    /// Extracts confirmed user-defined structure type references.
+    ///
+    /// Currently supports only compiled .str objects.
+    /// Does not interpret the special 4077/4077 descriptor.
+    pub fn structure_type_references(
+        &self,
+        data: &[u8],
+    ) -> Vec<PbTypeReference> {
+        if self.object_tag != 0x4079 {
+            return Vec::new();
+        }
+
+        let Some(table_end) = self.descriptors.len()
+            .checked_mul(12)
+            .and_then(|n| n.checked_add(0x20))
+        else {
+            return Vec::new();
+        };
+
+        let mut result = Vec::new();
+
+        for (index, d) in self.descriptors.iter().enumerate() {
+            let recognized =
+                (d.tag_a == 0x4079
+                    && d.tag_b == 0x8001
+                    && matches!(d.flags, 0x0121 | 0x1121))
+                ||
+                (d.tag_a == 0x40D3
+                    && d.tag_b == 0x40D3
+                    && d.flags == 0x0121);
+
+            if !recognized
+                || d.field_8 == 0
+                || (d.field_8 & 0xFFFF) != 0
+            {
+                continue;
+            }
+
+            let Some(mut pos) = table_end
+                .checked_add(d.field_6 as usize)
+            else {
+                continue;
+            };
+
+            if data.get(pos..pos.saturating_add(2))
+                != Some(&[0, 0][..])
+            {
+                continue;
+            }
+
+            pos += 2;
+            let mut name = String::new();
+
+            for _ in 0..128 {
+                let Some(bytes) =
+                    data.get(pos..pos.saturating_add(2))
+                else {
+                    break;
+                };
+
+                let ch = u16::from_le_bytes([
+                    bytes[0], bytes[1],
+                ]);
+
+                pos += 2;
+
+                if ch == 0 {
+                    if !name.is_empty() {
+                        result.push(PbTypeReference {
+                            name,
+                            type_id: (d.field_8 >> 16) as u16,
+                            descriptor_index: index,
+                            tag_a: d.tag_a,
+                            tag_b: d.tag_b,
+                            flags: d.flags,
+                        });
+                    }
+                    break;
+                }
+
+                // Structure names observed so far use
+                // ASCII identifiers.
+                let valid =
+                    (0x41..=0x5A).contains(&ch)
+                    || (0x61..=0x7A).contains(&ch)
+                    || (0x30..=0x39).contains(&ch)
+                    || ch == 0x5F;
+
+                if !valid {
+                    break;
+                }
+
+                name.push(char::from_u32(ch as u32).unwrap());
+            }
+        }
+
+        result
+    }
+}
