@@ -1,0 +1,9 @@
+# Rust workspace root for VS Code / rust-analyzer and cargo commands.
+# Keep the Tauri desktop project separate; it has its own dependencies and build.
+[workspace]
+resolver = "2"
+members = [
+    "pb-devkit-2.x/pb-devkit-core",
+    "pb-devkit-2.x/pb-devkit-cli",
+]
+default-members = ["pb-devkit-2.x/pb-devkit-cli"]
