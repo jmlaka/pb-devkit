@@ -344,6 +344,10 @@ fn operand_i32(bytes: &[u8]) -> Option<i32> {
 fn opcode_note(opcode: u16, operands: &[u8]) -> String {
     match opcode {
         0x0000 => "return (no value)".into(),
+        0x0005 => "CONNECT USING transaction object".into(),
+        0x0006 => "COMMIT USING transaction object".into(),
+        0x0007 => "ROLLBACK USING transaction object".into(),
+        0x0008 => "DISCONNECT USING transaction object".into(),
         0x0001 => match operand_u16(operands) {
             Some(1) => "return value from stack".into(),
             Some(0) => "return (no value)".into(),
@@ -779,7 +783,10 @@ fn annotated_opcode(
         0x00a8 => "comparison: =".into(),
         0x0025 => "logical OR".into(),
         0x00f8 => "increment variable (++)".into(),
+        0x0005 => "SQL CONNECT".into(),
         0x0006 => "SQL COMMIT".into(),
+        0x0007 => "SQL ROLLBACK".into(),
+        0x0008 => "SQL DISCONNECT".into(),
         _ => opcode_note(opcode, operands),
     }
 }
@@ -884,7 +891,7 @@ fn flow_statement(
             stack.push(flow_local(sym, p));
             None
         }
-        0x002f => {
+        0x002f | 0x011f => {
             stack.push(flow_global(sym, p));
             None
         }
@@ -949,7 +956,7 @@ fn flow_statement(
             stack.push(flow_field_name(sym,p));
             None
         }
-        0x0027 => {
+        0x0027 | 0x0122 => {
             let field=flow_pop(stack);
             let object=flow_pop(stack);
             stack.push(if field=="entryobject" {
@@ -989,9 +996,15 @@ fn flow_statement(
                 ))
             }
         }
-        0x0006 => {
-            let sqlca=flow_pop(stack);
-            Some(format!("COMMIT USING {sqlca}"))
+        0x0005 | 0x0006 | 0x0007 | 0x0008 => {
+            let transaction=flow_pop(stack);
+            let verb=match op {
+                0x0005=>"CONNECT",
+                0x0006=>"COMMIT",
+                0x0007=>"ROLLBACK",
+                _=>"DISCONNECT"
+            };
+            Some(format!("{verb} USING {transaction}"))
         }
         0x01bc => {
             let function_index=flow_operand_word(p,0);
@@ -1322,6 +1335,99 @@ fn print_structured(sym: &FunctionSymbols, reveal_strings: bool)
     Ok(())
 }
 
+
+// Identify compiled PowerBuilder database connection sites without reading
+// credentials or displaying string literals. PB333 0x0005 maps through
+// PCodeParser110->105->100->90 to SqlOperateTransaction("connect").
+fn scan_db_connections(parser: &PblParser) -> Result<(), Box<dyn std::error::Error>> {
+    const SUFFIXES: &[&str] = &[".fun", ".win", ".apl", ".udo"];
+    let mut seen=0usize;
+    let mut validated=0usize;
+    let mut skipped=0usize;
+    let mut connect_entries=0usize;
+    let mut connection_sites=0usize;
+    let mut filename_candidates=Vec::new();
+    println!("=== PB333 DATABASE CONNECT LOCATION SCAN ===");
+    println!("Target opcode: 0x0005 = CONNECT USING <transaction>");
+    println!("No literal strings, parameter values or credentials will be printed.\n");
+    for entry in parser.entries().iter()
+        .filter(|e| SUFFIXES.iter().any(|ext| e.name.to_ascii_lowercase().ends_with(ext)))
+    {
+        seen += 1;
+        let name=entry.name.to_ascii_lowercase();
+        if ["connect","login","prihlas","overenie_prihlas","post_login"]
+            .iter().any(|part|name.contains(part))
+        {
+            filename_candidates.push(entry.name.clone());
+        }
+        let data=match parser.parse_chunk_chain(entry.data_offset,entry.size) {
+            Ok(bytes)=>bytes,
+            Err(_)=>{skipped+=1;continue;}
+        };
+        let inspection=match inspect(&data) {
+            Ok(result) if result.problems.is_empty()
+                && result.decoded_bodies==result.bodies => result,
+            _=>{skipped+=1;continue;}
+        };
+        validated+=1;
+        let n=inspection.opcode_counts.get(&0x0005).copied().unwrap_or(0);
+        if n==0 {continue;}
+        connect_entries+=1;
+        println!("CONNECT ENTRY: {} ({} opcode occurrence(s), {} bodies)",
+                 entry.name,n,inspection.bodies);
+        for body_index in 0..inspection.bodies {
+            let sym=match find_pcode_symbols(&data,body_index) {
+                Ok(sym)=>sym,
+                Err(err)=>{
+                    println!("  body {}: unable to resolve symbols: {}",body_index,err);
+                    continue;
+                }
+            };
+            let lines=flow_instructions(&sym.code)?;
+            for (i,ins) in lines.iter().enumerate().filter(|(_,x)|x.opcode==0x0005) {
+                connection_sites+=1;
+                let target=match i.checked_sub(1).and_then(|j|lines.get(j)) {
+                    Some(previous) if previous.opcode==0x002f =>
+                        flow_global(&sym,&previous.operands),
+                    Some(previous) if matches!(previous.opcode,0x001e|0x01a9|0x0150) =>
+                        flow_local(&sym,&previous.operands),
+                    _=>"<transaction expression not yet reconstructed>".into()
+                };
+                println!("  body={} P-code offset=0x{:04X} CONNECT USING {}",
+                    body_index,ins.position,target);
+                let fields: std::collections::BTreeSet<String>=lines.iter()
+                    .filter(|x|x.opcode==0x0020)
+                    .map(|x|flow_field_name(&sym,&x.operands))
+                    .filter(|field| {
+                        ["dbms","dbparm","database","servername","userid",
+                         "dbpass","logid","logpass","autocommit","sqlcode"]
+                        .contains(&field.to_ascii_lowercase().as_str())
+                    }).collect();
+                if !fields.is_empty() {
+                    println!("  referenced transaction properties: {}",
+                        fields.into_iter().collect::<Vec<_>>().join(", "));
+                }
+            }
+        }
+    }
+    println!("\nSCAN SUMMARY: entries considered={}, validated={}, skipped={}",
+        seen,validated,skipped);
+    println!("Entries with CONNECT={}, located CONNECT sites={}",connect_entries,connection_sites);
+    println!("\nFILENAME CANDIDATES (may implement application rather than DB login):");
+    filename_candidates.sort();
+    filename_candidates.dedup();
+    for candidate in filename_candidates.iter().take(50) {
+        println!("  {candidate}");
+    }
+    if connect_entries==0 {
+        println!("No direct CONNECT opcode found in parsed entries. It may be located");
+        println!("in an unsupported object type or implemented through external code.");
+    }
+    println!("\nTo inspect a candidate without showing strings:");
+    println!("  cargo run --release -p pb-devkit-cli --example probe_pcode -- f_connect.fun 0 120 --flow");
+    Ok(())
+}
+
 fn disassemble_one(
     parser: &PblParser,
     name: &str,
@@ -1394,6 +1500,13 @@ fn disassemble_one(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|arg|arg=="--db-scan").unwrap_or(false) {
+        if args.len()!=1 {
+            return Err("usage: probe_pcode --db-scan".into());
+        }
+        let parser=PblParser::new(EXE)?;
+        return scan_db_connections(&parser);
+    }
     // Optional mode: <name.fun> [body_index=0] [max_instructions=80]
     if !args.is_empty() {
         if args.len() > 7 || args.iter().skip(3).any(|x|
@@ -1502,6 +1615,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn connect_opcode_emits_transaction_operation_without_secrets() {
+        let symbol = FunctionSymbols {
+            code: Vec::new(), stack_buffer: Vec::new(),
+            locals: Vec::new(), globals: Vec::new(),
+            referenced_functions: Vec::new(), sql_pool: Vec::new(),
+        };
+        let instruction = FlowInsn {
+            position: 0, end: 2, opcode: 0x0005,
+            operands: Vec::new(),
+        };
+        let mut stack = vec!["sqlca".to_string()];
+        assert_eq!(
+            flow_statement(&instruction,&symbol,&mut stack,false),
+            Some("CONNECT USING sqlca".to_string())
+        );
+        assert!(stack.is_empty());
+        let (instruction_count, frequency)=decode_pcode(&[0x05,0x00]).unwrap();
+        assert_eq!(instruction_count,1);
+        assert_eq!(frequency.get(&0x0005),Some(&1));
+    }
+
 
     #[test]
     fn known_constant_return_pattern() {
