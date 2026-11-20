@@ -1795,7 +1795,7 @@ fn transaction_field_evidence(parser:&PblParser)
     let mut parse_errors=0usize;
     for entry in parser.entries().iter().filter(|e|{
         let n=e.name.to_ascii_lowercase();
-        [".fun",".win",".udo",".apl"].iter().any(|ext|n.ends_with(ext))
+        [".fun",".win",".udo",".apl"].iter().any(|ext|n.ends_with(*ext))
     }) {
         let data=match parser.parse_chunk_chain(entry.data_offset,entry.size) {
             Ok(bytes)=>bytes,
