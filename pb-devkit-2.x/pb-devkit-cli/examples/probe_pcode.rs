@@ -1854,7 +1854,7 @@ mod semantic_probe_tests {
             code:Vec::new(),stack_buffer:Vec::new(),
             locals:vec![VariableSymbol {name:"atrans".into(),global_index:None,type_id:0x4000}],
             globals:Vec::new(),referenced_functions:Vec::new(),
-            sql_pool:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
         };
         assert_eq!(flow_local(&symbols,&[0,0]),"atrans");
         let mut stack=Vec::new();
