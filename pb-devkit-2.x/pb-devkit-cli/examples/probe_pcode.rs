@@ -396,6 +396,77 @@ fn find_pcode_body(data: &[u8], selected: usize) -> Result<Vec<u8>, String> {
     ))
 }
 
+
+// These annotations are intentionally narrow and correspond to specific PB333
+// opcode cases from PbdViewer's version conversion and PCodeParser90/105:
+// 0x0034 -> PushConstant((int32) operand), 0x0001 -> Return(flag),
+// 0x0000 -> Return(void), 0x0002..0x0004 -> jump family.
+fn operand_u16(bytes: &[u8]) -> Option<u16> {
+    let pair = bytes.get(..2)?;
+    Some(u16::from_le_bytes([pair[0], pair[1]]))
+}
+
+fn operand_i32(bytes: &[u8]) -> Option<i32> {
+    let quad = bytes.get(..4)?;
+    Some(i32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
+}
+
+fn opcode_note(opcode: u16, operands: &[u8]) -> String {
+    match opcode {
+        0x0000 => "return (no value)".into(),
+        0x0001 => match operand_u16(operands) {
+            Some(1) => "return value from stack".into(),
+            Some(0) => "return (no value)".into(),
+            Some(n) => format!("return flag={n} (unknown meaning)"),
+            None => "truncated return flag".into(),
+        },
+        0x0002 | 0x0003 | 0x0004 => match operand_u16(operands) {
+            Some(target) => {
+                let condition = match opcode {
+                    0x0002 => "if true",
+                    0x0003 => "if false",
+                    _ => "unconditional",
+                };
+                format!("jump {} to byte offset 0x{:04X}", condition, target)
+            }
+            None => "truncated jump target".into(),
+        },
+        0x0034 => match operand_i32(operands) {
+            Some(value) => format!("signed 32-bit integer literal: {value}"),
+            None => "truncated integer constant".into(),
+        },
+        _ => String::new(),
+    }
+}
+
+// Only claim a source-level preview when the *entire* body matches a known
+// stack pattern, optionally followed by the compiler's unreachable epilogue.
+// Do not generalize to unknown control flow or object/function resolution.
+fn simple_constant_return(code: &[u8]) -> Option<i32> {
+    if code.len() != 10 && code.len() != 16 {
+        return None;
+    }
+    if operand_u16(code.get(0..2)?)? != 0x0034
+        || operand_u16(code.get(6..8)?)? != 0x0001
+        || operand_u16(code.get(8..10)?)? != 1
+    {
+        return None;
+    }
+
+    if code.len() == 16 {
+        // The jump following the return is unreachable; its sole target is
+        // the terminal zero-operand return at offset 0x000E.
+        if operand_u16(code.get(10..12)?)? != 0x0004
+            || operand_u16(code.get(12..14)?)? != 0x000E
+            || operand_u16(code.get(14..16)?)? != 0x0000
+        {
+            return None;
+        }
+    }
+
+    operand_i32(code.get(2..6)?)
+}
+
 fn disassemble_one(
     parser: &PblParser,
     name: &str,
@@ -421,22 +492,24 @@ fn disassemble_one(
     println!("Instructions: {}", instruction_count);
     println!("Showing first {} instructions", limit.min(instruction_count));
     println!();
-    println!("{:<8} {:<8} {:<32} {}", "OFFSET", "OPCODE", "ACTION", "OPERANDS (u16 LE)");
+    println!("{:<8} {:<8} {:<28} {:<22} {}", "OFFSET", "OPCODE", "ACTION", "OPERANDS (u16 LE)", "INTERPRETATION");
 
     let mut pos = 0usize;
     let mut printed = 0usize;
     while pos < code.len() && printed < limit {
         let opcode = u16::from_le_bytes([code[pos], code[pos + 1]]);
         let words = OPERAND_WORDS[opcode as usize] as usize;
-        let operands = code[pos + 2..pos + 2 + words * 2].chunks_exact(2)
+        let operand_bytes = &code[pos + 2..pos + 2 + words * 2];
+        let operands = operand_bytes.chunks_exact(2)
             .map(|pair| {
                 format!("{:04X}", u16::from_le_bytes([pair[0], pair[1]]))
             })
             .collect::<Vec<_>>()
             .join(" ");
         println!(
-            "0x{:04X}   0x{:04X}   {:<32} {}",
-            pos, opcode, opcode_action(opcode), operands
+            "0x{:04X}   0x{:04X}   {:<28} {:<22} {}",
+            pos, opcode, opcode_action(opcode), operands,
+            opcode_note(opcode, operand_bytes)
         );
         pos += 2 + words * 2;
         printed += 1;
@@ -445,7 +518,14 @@ fn disassemble_one(
     if printed < instruction_count {
         println!("... {} additional instructions omitted", instruction_count - printed);
     }
-    println!("\nNote: operands are raw numbers; operation names are not reconstructed PowerScript.");
+    if let Some(value) = simple_constant_return(&code) {
+        println!("\n=== CONSERVATIVE POWERSCRIPT PREVIEW ===");
+        println!("return {}", value);
+        println!("Matched the entire body, including any unreachable epilogue.");
+    } else {
+        println!("\nNo source-level preview: this body requires stack/control-flow analysis.");
+    }
+    println!("Note: most operands remain raw numbers, not resolved variable names or literals.");
     Ok(())
 }
 
@@ -546,4 +626,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+
+#[cfg(test)]
+mod semantic_probe_tests {
+    use super::*;
+
+    #[test]
+    fn known_constant_return_pattern() {
+        let bytes = [
+            0x34, 0x00, 0x00, 0x80, 0x00, 0x00,
+            0x01, 0x00, 0x01, 0x00,
+            0x04, 0x00, 0x0e, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(simple_constant_return(&bytes), Some(32768));
+        assert_eq!(opcode_note(0x0034, &bytes[2..6]),
+                   "signed 32-bit integer literal: 32768");
+        assert!(opcode_note(0x0004, &[0x0e, 0x00]).contains("0x000E"));
+    }
+
+    #[test]
+    fn reject_unrecognized_epilogue() {
+        let bytes = [
+            0x34, 0x00, 0x00, 0x80, 0x00, 0x00,
+            0x01, 0x00, 0x01, 0x00,
+            0x04, 0x00, 0x0c, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(simple_constant_return(&bytes), None);
+    }
 }
