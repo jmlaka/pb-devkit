@@ -467,11 +467,191 @@ fn simple_constant_return(code: &[u8]) -> Option<i32> {
     operand_i32(code.get(2..6)?)
 }
 
+
+// Name records and strings follow PbVariable.cs and BufferHelper.GetString()
+// (Hucxy/PbdViewer, MIT). Offsets into string pools are byte offsets.
+#[derive(Clone)]
+struct VariableSymbol {
+    name: String,
+    global_index: Option<u16>,
+}
+
+struct FunctionSymbols {
+    code: Vec<u8>,
+    stack_buffer: Vec<u8>,
+    locals: Vec<VariableSymbol>,
+    globals: Vec<VariableSymbol>,
+}
+
+fn pool_buffer(r: &mut Cursor<'_>) -> Result<Vec<u8>, String> {
+    let size = r.u32()? as usize;
+    let extra = r.u32()? as usize;
+    let bytes = r.bytes(size)?.to_vec();
+    r.bytes(extra)?;
+    Ok(bytes)
+}
+
+fn utf16_string(pool: &[u8], offset: u32) -> Option<String> {
+    let begin = (offset & 0x7fff_ffff) as usize;
+    let mut words = Vec::new();
+    let mut pos = begin;
+    for _ in 0..4096 {
+        let unit = pool.get(pos..pos.checked_add(2)?)?;
+        let ch = u16::from_le_bytes([unit[0], unit[1]]);
+        if ch == 0 {
+            return String::from_utf16(&words).ok();
+        }
+        words.push(ch);
+        pos += 2;
+    }
+    None
+}
+
+fn named_variables(r: &mut Cursor<'_>) -> Result<Vec<VariableSymbol>, String> {
+    r.bytes(6)?;
+    let names = pool_buffer(r)?;
+    let len = r.u16()? as usize;
+    if len % 20 != 0 {
+        return Err(format!("variable record size {} is not divisible by 20", len));
+    }
+    let records = r.bytes(len)?;
+    Ok(records.chunks_exact(20).enumerate().map(|(i, rec)| {
+        let offset = u32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+        let name = utf16_string(&names, offset)
+            .filter(|s| !s.chars().any(char::is_control))
+            .unwrap_or_else(|| format!("<variable#{i}>"));
+        let global_index = if rec[17] & 2 != 0 {
+            Some(u16::from_le_bytes([rec[12], rec[13]]))
+        } else { None };
+        VariableSymbol { name, global_index }
+    }).collect())
+}
+
+fn find_pcode_symbols(data: &[u8], selected: usize) -> Result<FunctionSymbols, String> {
+    let mut r = Cursor::new(data);
+    if r.u16()? != 333 {
+        return Err("not a version-333 compiled entry".into());
+    }
+    r.bytes(22)?;
+    let descriptor_count = r.u16()? as usize;
+    r.bytes(descriptor_count * 12)?;
+    r.struct_buffer()?;
+    let globals = named_variables(&mut r)?;
+    let object_count = r.u16()? as usize;
+    let extended_count = r.u16()? as usize;
+    r.struct_buffer()?;
+    r.struct_buffer()?;
+    r.records20()?;
+    r.records20()?;
+
+    let indices = r.bytes(object_count * 16)?;
+    let extended = r.bytes(extended_count * 32)?;
+    let mut used_extended = 0usize;
+    let mut function_index = 0usize;
+
+    for index in indices.chunks_exact(16) {
+        match (index[0] >> 1) & 7 {
+            0 => {
+                let p = used_extended * 32;
+                let header = extended.get(p..p + 32)
+                    .ok_or_else(|| "missing extended header".to_string())?;
+                used_extended += 1;
+                let bodies = r.u16()? as usize;
+                r.bytes(bodies * 4)?;
+                for _ in 0..bodies {
+                    let code_len = r.u16()? as usize;
+                    let debug_count = r.u16()? as usize;
+                    r.u16()?;
+                    let code = r.bytes(code_len)?.to_vec();
+                    r.bytes(debug_count * 4)?;
+
+                    if function_index == selected {
+                        let locals = named_variables(&mut r)?;
+                        let stack_buffer = pool_buffer(&mut r)?;
+                        return Ok(FunctionSymbols { code, stack_buffer, locals, globals });
+                    }
+
+                    function_index += 1;
+                    r.records20()?;
+                    r.struct_buffer()?;
+                }
+
+                r.bytes(word(header, 24)? * 6)?;
+                r.bytes(word(header, 22)? * 4)?;
+                r.records20()?;
+                r.records20()?;
+                r.bytes(word(header, 28)? * 8)?;
+                r.bytes(word(header, 26)? * 16)?;
+                r.bytes(word(header, 4)? * 48)?;
+            }
+            1 => { r.bytes(word(index, 4)? * 8)?; }
+            _ => {}
+        }
+    }
+    Err(format!("function body index {} not found", selected))
+}
+
+fn annotated_opcode(
+    opcode: u16,
+    operands: &[u8],
+    symbols: &FunctionSymbols,
+    show_strings: bool,
+) -> String {
+    match opcode {
+        0x001e | 0x01a9 | 0x0150 | 0x011d => {
+            let Some(index) = operand_u16(operands) else { return "missing variable index".into() };
+            match symbols.locals.get(index as usize) {
+                Some(v) => format!("local [{}]: {}", index, v.name),
+                None => format!("local [{}]: unresolved", index),
+            }
+        }
+        0x002f => {
+            let Some(index) = operand_u16(operands) else { return "missing variable index".into() };
+            let found = symbols.locals.iter()
+                .chain(symbols.globals.iter())
+                .find(|v| v.global_index == Some(index))
+                .map(|v| v.name.as_str());
+            match found {
+                Some(name) => format!("global [{}]: {}", index, name),
+                None => format!("global [{}]: unresolved", index),
+            }
+        }
+        0x003b => {
+            if operands.len() < 4 { return "missing string offset".into(); }
+            let offset = u32::from_le_bytes([
+                operands[0], operands[1], operands[2], operands[3]
+            ]);
+            match utf16_string(&symbols.stack_buffer, offset) {
+                Some(value) => {
+                    if show_strings {
+                        let escaped = value.escape_debug().to_string();
+                        let truncated: String = escaped.chars().take(160).collect();
+                        let suffix = if escaped.chars().count() > 160 { "..." } else { "" };
+                        format!("string literal: \"{}{}\"", truncated, suffix)
+                    } else {
+                        format!("string literal, {} chars [hidden; use --strings]", value.chars().count())
+                    }
+                }
+                None => format!("string offset 0x{:X} could not be decoded", offset),
+            }
+        }
+        0x0195 => "isnull(value)".into(),
+        0x00a8 => "comparison: =".into(),
+        0x0025 => "logical OR".into(),
+        0x00f8 => "increment variable (++)".into(),
+        0x0006 => "SQL COMMIT".into(),
+        0x0010 => "SQL SELECT".into(),
+        0x000f => "SQL DML (insert/update/delete), variant unresolved".into(),
+        _ => opcode_note(opcode, operands),
+    }
+}
+
 fn disassemble_one(
     parser: &PblParser,
     name: &str,
     body_index: usize,
     limit: usize,
+    show_strings: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entry = parser.entries().iter()
         .find(|e| e.name.eq_ignore_ascii_case(name)
@@ -482,8 +662,9 @@ fn disassemble_one(
     if !valid.problems.is_empty() || valid.decoded_bodies != valid.bodies {
         return Err(format!("entry {} fails opcode validation", entry.name).into());
     }
-    let code = find_pcode_body(&data, body_index)?;
-    let (instruction_count, _) = decode_pcode(&code)?;
+    let symbols = find_pcode_symbols(&data, body_index)?;
+    let code = &symbols.code;
+    let (instruction_count, _) = decode_pcode(code)?;
 
     println!("=== PB333 P-CODE DISASSEMBLY ===");
     println!("Entry: {}", entry.name);
@@ -509,7 +690,7 @@ fn disassemble_one(
         println!(
             "0x{:04X}   0x{:04X}   {:<28} {:<22} {}",
             pos, opcode, opcode_action(opcode), operands,
-            opcode_note(opcode, operand_bytes)
+            annotated_opcode(opcode, operand_bytes, &symbols, show_strings)
         );
         pos += 2 + words * 2;
         printed += 1;
@@ -533,15 +714,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Optional mode: <name.fun> [body_index=0] [max_instructions=80]
     if !args.is_empty() {
-        if args.len() > 3 {
-            return Err("usage: probe_pcode [name.fun [body_index [max_instructions]]]".into());
+        if args.len() > 4 || (args.len() == 4 && args[3] != "--strings") {
+            return Err("usage: probe_pcode [name.fun [body_index [max_instructions [--strings]]]]".into());
         }
         let body_index = args.get(1).map(|s| s.parse::<usize>())
             .transpose()?.unwrap_or(0);
         let limit = args.get(2).map(|s| s.parse::<usize>())
             .transpose()?.unwrap_or(80).min(1000);
+        let show_strings = args.get(3).map(|s| s == "--strings").unwrap_or(false);
         let parser = PblParser::new(EXE)?;
-        return disassemble_one(&parser, &args[0], body_index, limit);
+        return disassemble_one(&parser, &args[0], body_index, limit, show_strings);
     }
     let parser = PblParser::new(EXE)?;
     let mut total_objects = 0usize;
