@@ -578,6 +578,61 @@ fn sql_with_bound_params(
     }
 }
 
+// Diagnostic-only metadata about SQL cursor parameter tables.
+// Prints offsets and sizes, never template text, parameter values or byte dumps.
+fn print_sql_cursor_diagnostics(sym: &FunctionSymbols) -> Result<(), String> {
+    let lines=flow_instructions(&sym.code)?;
+    println!("\n=== SQL CURSOR METADATA (NO SQL TEXT) ===");
+    println!("Variable buffer length: {} bytes",sym.sql_pool.len());
+    for ins in lines.iter().filter(|x| matches!(x.opcode,0x0010|0x000f)) {
+        let name=if ins.opcode==0x0010 {"SELECT"} else {"DML"};
+        let params=flow_operand_word(&ins.operands,4);
+        let into=if ins.opcode==0x0010 {flow_operand_word(&ins.operands,6)} else {0};
+        println!("\n0x{:04X} {}: bind parameters={}, INTO variables={}",
+            ins.position,name,params,into);
+        let Some(cursor)=sql_cursor_record(sym,&ins.operands) else {
+            println!("  cursor record: not resolved");
+            continue;
+        };
+        println!("  terminal cursor offset: 0x{:08X}",cursor);
+        let mut read_u32=|delta:usize| -> Option<u32> {
+            let p=cursor.checked_add(delta)?;
+            let b=sym.sql_pool.get(p..p.checked_add(4)?)?;
+            Some(u32::from_le_bytes([b[0],b[1],b[2],b[3]]))
+        };
+        let link=read_u32(8);
+        let raw_param=read_u32(16);
+        let template=read_u32(24);
+        println!("  link (+8): {:?}; param ptr (+16): {:?}; text ptr (+24): {:?}",
+            link.map(|x|format!("0x{x:08X}")),
+            raw_param.map(|x|format!("0x{x:08X}")),
+            template.map(|x|format!("0x{x:08X}")));
+        if let Some(pointer)=raw_param {
+            for (label,pos) in [
+                ("raw",pointer as usize),
+                ("high-bit-masked",(pointer&0x7FFF_FFFF) as usize)
+            ] {
+                let room=pos.checked_add(params.saturating_mul(4))
+                    .map(|end|end<=sym.sql_pool.len()).unwrap_or(false);
+                println!("  candidate {label}: 0x{pos:08X}, {}",
+                    if room {"fits buffer"} else {"outside buffer"});
+                if pos.checked_add(4).map(|end|end<=sym.sql_pool.len())
+                    .unwrap_or(false)
+                {
+                    let b=&sym.sql_pool[pos..pos+4];
+                    let a=u16::from_le_bytes([b[0],b[1]]);
+                    let z=u16::from_le_bytes([b[2],b[3]]);
+                    println!("    first span: {}..{} (UTF-16 code units)",a,z);
+                }
+            }
+        }
+        let size=sql_template(sym,&ins.operands)
+            .map(|x|x.encode_utf16().count());
+        println!("  SQL template length (UTF-16 units): {:?}",size);
+    }
+    Ok(())
+}
+
 fn sql_with_into(mut statement: String, destinations: &[String], reveal: bool) -> String {
     if !reveal {return statement;}
     let lower=statement.to_ascii_lowercase();
@@ -1273,6 +1328,7 @@ fn disassemble_one(
     show_strings: bool,
     show_flow: bool,
     show_structured: bool,
+    show_sql_debug: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entry = parser.entries().iter()
         .find(|e| e.name.eq_ignore_ascii_case(name)
@@ -1330,6 +1386,7 @@ fn disassemble_one(
     println!("Note: most operands remain raw numbers, not resolved variable names or literals.");
     if show_flow { print_flow(&symbols,show_strings)?; }
     if show_structured { print_structured(&symbols,show_strings)?; }
+    if show_sql_debug { print_sql_cursor_diagnostics(&symbols)?; }
     Ok(())
 }
 
@@ -1337,10 +1394,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Optional mode: <name.fun> [body_index=0] [max_instructions=80]
     if !args.is_empty() {
-        if args.len() > 6 || args.iter().skip(3).any(|x|
-            x != "--flow" && x != "--strings" && x != "--structured"
+        if args.len() > 7 || args.iter().skip(3).any(|x|
+            x != "--flow" && x != "--strings" && x != "--structured" && x != "--sql-debug"
         ) {
-            return Err("usage: probe_pcode [name.fun [body_index [max_instructions [--flow] [--structured] [--strings]]]]".into());
+            return Err("usage: probe_pcode [name.fun [body_index [max_instructions [--flow] [--structured] [--sql-debug] [--strings]]]]".into());
         }
         let body_index = args.get(1).map(|s| s.parse::<usize>())
             .transpose()?.unwrap_or(0);
@@ -1349,9 +1406,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let show_strings = args.iter().skip(3).any(|s| s == "--strings");
         let show_flow = args.iter().skip(3).any(|s| s == "--flow");
         let show_structured = args.iter().skip(3).any(|s| s == "--structured");
+        let show_sql_debug = args.iter().skip(3).any(|s| s == "--sql-debug");
         let parser = PblParser::new(EXE)?;
         return disassemble_one(&parser, &args[0], body_index, limit,
-                               show_strings, show_flow, show_structured);
+                               show_strings, show_flow, show_structured, show_sql_debug);
     }
     let parser = PblParser::new(EXE)?;
     let mut total_objects = 0usize;
