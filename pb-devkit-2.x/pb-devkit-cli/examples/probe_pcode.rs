@@ -1,6 +1,7 @@
 //! Read-only PowerBuilder 12.x P-code boundary verification.
 //! Based on PbEntry.cs and PCodeParser110.cs from Hucxy/PbdViewer.
-//! Tests instruction boundaries only; does NOT emit operands, bytecode or strings.
+//! Default: tests instruction boundaries without printing operands or strings.
+//! With a .fun name argument: prints a local, limited opcode/operand listing.
 //!
 //! Opcode-length table adapted from:
 //! https://github.com/Hucxy/PbdViewer/blob/main/Uitils/PCode/PCodeParser110.cs
@@ -325,7 +326,143 @@ fn opcode_action(op: u16) -> &'static str {
     }
 }
 
+
+// Extract a chosen P-code body from an already-validated PB333 .fun entry.
+// Body indices are zero-based and count all bodies inside the entry.
+fn find_pcode_body(data: &[u8], selected: usize) -> Result<Vec<u8>, String> {
+    let mut r = Cursor::new(data);
+    if r.u16()? != 333 {
+        return Err("not a version-333 compiled entry".into());
+    }
+    r.bytes(22)?;
+    let descriptor_count = r.u16()? as usize;
+    r.bytes(descriptor_count * 12)?;
+    r.struct_buffer()?;
+    r.records20()?;
+    let object_count = r.u16()? as usize;
+    let extended_count = r.u16()? as usize;
+    r.struct_buffer()?;
+    r.struct_buffer()?;
+    r.records20()?;
+    r.records20()?;
+
+    let object_indices = r.bytes(object_count * 16)?;
+    let extended_headers = r.bytes(extended_count * 32)?;
+    let mut extended_used = 0usize;
+    let mut body_index = 0usize;
+
+    for object in object_indices.chunks_exact(16) {
+        match (object[0] >> 1) & 7 {
+            0 => {
+                let header_start = extended_used * 32;
+                let header = extended_headers.get(header_start..header_start + 32)
+                    .ok_or_else(|| "missing extended object header".to_string())?;
+                extended_used += 1;
+
+                let bodies = r.u16()? as usize;
+                r.bytes(bodies * 4)?;
+                for _ in 0..bodies {
+                    let code_length = r.u16()? as usize;
+                    let debug_count = r.u16()? as usize;
+                    r.u16()?;
+                    let code = r.bytes(code_length)?;
+                    if body_index == selected {
+                        return Ok(code.to_vec());
+                    }
+                    body_index += 1;
+                    r.bytes(debug_count * 4)?;
+                    r.records20()?;
+                    r.struct_buffer()?;
+                }
+
+                r.bytes(word(header, 24)? * 6)?;
+                r.bytes(word(header, 22)? * 4)?;
+                r.records20()?;
+                r.records20()?;
+                r.bytes(word(header, 28)? * 8)?;
+                r.bytes(word(header, 26)? * 16)?;
+                r.bytes(word(header, 4)? * 48)?;
+            }
+            1 => {
+                r.bytes(word(object, 4)? * 8)?;
+            }
+            _ => {}
+        }
+    }
+
+    Err(format!(
+        "P-code body index {} not found (available: 0..{})",
+        selected, body_index
+    ))
+}
+
+fn disassemble_one(
+    parser: &PblParser,
+    name: &str,
+    body_index: usize,
+    limit: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry = parser.entries().iter()
+        .find(|e| e.name.eq_ignore_ascii_case(name)
+            && e.name.to_ascii_lowercase().ends_with(".fun"))
+        .ok_or_else(|| format!("compiled .fun entry not found: {name}"))?;
+    let data = parser.parse_chunk_chain(entry.data_offset, entry.size)?;
+    let valid = inspect(&data)?;
+    if !valid.problems.is_empty() || valid.decoded_bodies != valid.bodies {
+        return Err(format!("entry {} fails opcode validation", entry.name).into());
+    }
+    let code = find_pcode_body(&data, body_index)?;
+    let (instruction_count, _) = decode_pcode(&code)?;
+
+    println!("=== PB333 P-CODE DISASSEMBLY ===");
+    println!("Entry: {}", entry.name);
+    println!("Body index (zero-based): {}", body_index);
+    println!("P-code size: {} bytes", code.len());
+    println!("Instructions: {}", instruction_count);
+    println!("Showing first {} instructions", limit.min(instruction_count));
+    println!();
+    println!("{:<8} {:<8} {:<32} {}", "OFFSET", "OPCODE", "ACTION", "OPERANDS (u16 LE)");
+
+    let mut pos = 0usize;
+    let mut printed = 0usize;
+    while pos < code.len() && printed < limit {
+        let opcode = u16::from_le_bytes([code[pos], code[pos + 1]]);
+        let words = OPERAND_WORDS[opcode as usize] as usize;
+        let operands = code[pos + 2..pos + 2 + words * 2].chunks_exact(2)
+            .map(|pair| {
+                format!("{:04X}", u16::from_le_bytes([pair[0], pair[1]]))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!(
+            "0x{:04X}   0x{:04X}   {:<32} {}",
+            pos, opcode, opcode_action(opcode), operands
+        );
+        pos += 2 + words * 2;
+        printed += 1;
+    }
+
+    if printed < instruction_count {
+        println!("... {} additional instructions omitted", instruction_count - printed);
+    }
+    println!("\nNote: operands are raw numbers; operation names are not reconstructed PowerScript.");
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Optional mode: <name.fun> [body_index=0] [max_instructions=80]
+    if !args.is_empty() {
+        if args.len() > 3 {
+            return Err("usage: probe_pcode [name.fun [body_index [max_instructions]]]".into());
+        }
+        let body_index = args.get(1).map(|s| s.parse::<usize>())
+            .transpose()?.unwrap_or(0);
+        let limit = args.get(2).map(|s| s.parse::<usize>())
+            .transpose()?.unwrap_or(80).min(1000);
+        let parser = PblParser::new(EXE)?;
+        return disassemble_one(&parser, &args[0], body_index, limit);
+    }
     let parser = PblParser::new(EXE)?;
     let mut total_objects = 0usize;
     let mut parsed_objects = 0usize;
@@ -384,6 +521,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sum();
     println!("Used opcode IDs with mapped actions: {} / {}", mapped_opcodes, frequencies.len());
     println!("Instructions with mapped actions: {} / {}", mapped_instructions, instructions);
+
+
+    let mut unknown: Vec<(u16, usize)> = frequencies.iter()
+        .filter(|(opcode, _)| opcode_action(**opcode) == "Unmapped")
+        .map(|(opcode, count)| (*opcode, *count))
+        .collect();
+    unknown.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    println!("\nUNMAPPED OPCODES (ID, COUNT):");
+    for (opcode, count) in &unknown {
+        println!("  0x{:04X}  {}", opcode, count);
+    }
 
     let mut ranked: Vec<_> = frequencies.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
