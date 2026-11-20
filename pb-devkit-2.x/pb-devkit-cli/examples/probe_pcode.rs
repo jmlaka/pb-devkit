@@ -361,6 +361,7 @@ fn find_pcode_body(data: &[u8], selected: usize) -> Result<Vec<u8>, String> {
 
                 let bodies = r.u16()? as usize;
                 r.bytes(bodies * 4)?;
+                let mut selected_data: Option<FunctionSymbols> = None;
                 for _ in 0..bodies {
                     let code_length = r.u16()? as usize;
                     let debug_count = r.u16()? as usize;
@@ -377,7 +378,11 @@ fn find_pcode_body(data: &[u8], selected: usize) -> Result<Vec<u8>, String> {
 
                 r.bytes(word(header, 24)? * 6)?;
                 r.bytes(word(header, 22)? * 4)?;
-                r.records20()?;
+                let references = named_references(&mut r)?;
+                if let Some(mut data) = selected_data {
+                    data.referenced_functions = references;
+                    return Ok(data);
+                }
                 r.records20()?;
                 r.bytes(word(header, 28)? * 8)?;
                 r.bytes(word(header, 26)? * 16)?;
@@ -481,6 +486,8 @@ struct FunctionSymbols {
     stack_buffer: Vec<u8>,
     locals: Vec<VariableSymbol>,
     globals: Vec<VariableSymbol>,
+    referenced_functions: Vec<String>,
+    sql_pool: Vec<u8>,
 }
 
 fn pool_buffer(r: &mut Cursor<'_>) -> Result<Vec<u8>, String> {
@@ -527,6 +534,58 @@ fn named_variables(r: &mut Cursor<'_>) -> Result<Vec<VariableSymbol>, String> {
     }).collect())
 }
 
+
+fn named_references(r: &mut Cursor<'_>) -> Result<Vec<String>, String> {
+    // PbdViewer ReadReferencedFunctions(): 6 bytes, name pool,
+    // u16 byte count, then 20-byte records (name offset at +8).
+    r.bytes(6)?;
+    let pool = pool_buffer(r)?;
+    let len = r.u16()? as usize;
+    if len % 20 != 0 {
+        return Err(format!("referenced-function table size {} not divisible by 20",len));
+    }
+    let records = r.bytes(len)?;
+    Ok(records.chunks_exact(20).enumerate().map(|(i,rec)| {
+        let offset = u32::from_le_bytes([rec[8],rec[9],rec[10],rec[11]]);
+        utf16_string(&pool,offset)
+            .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
+            .unwrap_or_else(|| format!("<unresolved-function-ref#{i}>"))
+    }).collect())
+}
+
+fn sql_template(sym: &FunctionSymbols, args: &[u8]) -> Option<String> {
+    // Adaptation of PbdViewer BufferHelper.GetCursor: follow linked cursor
+    // records using +8 until u32(0xFFFF), then read UTF-16 text at +24.
+    let raw = args.get(0..4)?;
+    let mut off = (u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]) & 0x7fff_ffff) as usize;
+    for _ in 0..32 {
+        let next = sym.sql_pool.get(off.checked_add(8)?..off.checked_add(12)?)?;
+        let ptr = u32::from_le_bytes([next[0],next[1],next[2],next[3]]);
+        if ptr == 65535 {
+            let text_pos = sym.sql_pool.get(off.checked_add(24)?..off.checked_add(28)?)?;
+            let text_offset = u32::from_le_bytes([
+                text_pos[0],text_pos[1],text_pos[2],text_pos[3]
+            ]);
+            return utf16_string(&sym.sql_pool,text_offset);
+        }
+        off=(ptr & 0x7fff_ffff) as usize;
+    }
+    None
+}
+
+fn sql_info(sym: &FunctionSymbols, args: &[u8], reveal: bool) -> String {
+    match sql_template(sym,args) {
+        Some(text) if reveal => {
+            let escaped=text.replace('\n'," ").replace('\r'," ");
+            let mut trimmed: String=escaped.chars().take(600).collect();
+            if escaped.chars().count()>600 { trimmed.push_str("..."); }
+            trimmed
+        }
+        Some(text) => format!("<SQL template hidden, {} chars; use --strings>",text.chars().count()),
+        None => "<SQL template not resolved>".into(),
+    }
+}
+
 fn find_pcode_symbols(data: &[u8], selected: usize) -> Result<FunctionSymbols, String> {
     let mut r = Cursor::new(data);
     if r.u16()? != 333 {
@@ -535,7 +594,7 @@ fn find_pcode_symbols(data: &[u8], selected: usize) -> Result<FunctionSymbols, S
     r.bytes(22)?;
     let descriptor_count = r.u16()? as usize;
     r.bytes(descriptor_count * 12)?;
-    r.struct_buffer()?;
+    let sql_pool = pool_buffer(&mut r)?;
     let globals = named_variables(&mut r)?;
     let object_count = r.u16()? as usize;
     let extended_count = r.u16()? as usize;
@@ -568,12 +627,16 @@ fn find_pcode_symbols(data: &[u8], selected: usize) -> Result<FunctionSymbols, S
                     if function_index == selected {
                         let locals = named_variables(&mut r)?;
                         let stack_buffer = pool_buffer(&mut r)?;
-                        return Ok(FunctionSymbols { code, stack_buffer, locals, globals });
+                        selected_data = Some(FunctionSymbols {
+                            code, stack_buffer, locals,
+                            globals: globals.clone(), referenced_functions: Vec::new(),
+                            sql_pool: sql_pool.clone()
+                        });
+                    } else {
+                        r.records20()?;
+                        r.struct_buffer()?;
                     }
-
                     function_index += 1;
-                    r.records20()?;
-                    r.struct_buffer()?;
                 }
 
                 r.bytes(word(header, 24)? * 6)?;
@@ -635,6 +698,17 @@ fn annotated_opcode(
                 None => format!("string offset 0x{:X} could not be decoded", offset),
             }
         }
+        0x01bc => {
+            let idx = flow_operand_word(operands,0);
+            let object_id = flow_operand_word(operands,2);
+            if object_id & 0x8000 != 0 {
+                match symbols.referenced_functions.get(idx) {
+                    Some(name) => format!("function reference [{idx}]: {name}"),
+                    None => format!("unresolved function reference [{idx}]")
+                }
+            } else { format!("system/object function reference [{idx}]") }
+        },
+        0x0010 | 0x000f => sql_info(symbols,operands,show_strings),
         0x0195 => "isnull(value)".into(),
         0x00a8 => "comparison: =".into(),
         0x0025 => "logical OR".into(),
@@ -826,16 +900,16 @@ fn flow_statement(
             let params=flow_pop_n(stack,flow_operand_word(p,4));
             let destinations=flow_pop_n(stack,flow_operand_word(p,6));
             Some(format!(
-                "SQL SELECT <SQL text hidden> INTO :{} USING {}; INPUTS: {}",
-                destinations.join(", :"),sqlca,params.join(", ")
+                "SQL SELECT {} INTO :{} USING {}; INPUTS: {}",
+                sql_info(sym,p,reveal_strings),destinations.join(", :"),sqlca,params.join(", ")
             ))
         }
         0x000f => {
             let sqlca=flow_pop(stack);
             let params=flow_pop_n(stack,flow_operand_word(p,4));
             Some(format!(
-                "SQL DML <SQL text hidden> USING {}; PARAMETERS: {}",
-                sqlca,params.join(", ")
+                "SQL DML {} USING {}; PARAMETERS: {}",
+                sql_info(sym,p,reveal_strings),sqlca,params.join(", ")
             ))
         }
         0x0006 => {
@@ -846,7 +920,11 @@ fn flow_statement(
             let function_index=flow_operand_word(p,0);
             // For object ref 0x8001, this index is an entry in the
             // referenced-functions table. The actual name is not yet resolved.
-            stack.push(format!("<global-function-ref#{function_index}>"));
+            let object_id=flow_operand_word(p,2);
+            let name=if object_id & 0x8000 != 0 {
+                sym.referenced_functions.get(function_index).cloned()
+            } else { None };
+            stack.push(name.unwrap_or_else(||format!("<global-function-ref#{function_index}>")));
             None
         }
         0x01bd => {
