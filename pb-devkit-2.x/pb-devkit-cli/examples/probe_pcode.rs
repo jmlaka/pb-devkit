@@ -1443,6 +1443,37 @@ fn scan_db_connections(parser: &PblParser) -> Result<(), Box<dyn std::error::Err
 // Trace credential *provenance* at the CONNECT site without outputting
 // secrets, user names, connection strings, or literal values. Does not
 // perform authentication or modify PowerBuilder/ODBC configuration.
+// Report metadata of a PB333 field-name descriptor, never its value.
+// PbdViewer PushInstanceVariableName: u32 at offset 0, member index u16
+// at offset +4. A low word 0xFFFF means the name is implied by the
+// associated object type rather than present as a UTF-16 string.
+fn field_descriptor_metadata(sym: &FunctionSymbols, operands: &[u8]) -> String {
+    let Some(offset) = operand_u16(operands).map(usize::from) else {
+        return "missing field descriptor".into();
+    };
+    if (1..=7).contains(&offset) { return "entry-object marker".into(); }
+    let Some(raw) = sym.stack_buffer.get(offset..offset.saturating_add(6)) else {
+        return format!("field descriptor at 0x{offset:04X}: unavailable");
+    };
+    let word = u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+    let index = u16::from_le_bytes([raw[4],raw[5]]);
+    if word & 0xffff == 0xffff {
+        format!("type-indexed member=#{index}, name requires transaction type catalog")
+    } else {
+        let pointer=word & 0x7fff_ffff;
+        format!("inline-name pointer=0x{pointer:08X}, member index=#{index}")
+    }
+}
+
+fn referenced_function_at(sym: &FunctionSymbols, ins: &FlowInsn) -> Option<String> {
+    if ins.opcode != 0x01bc { return None; }
+    let index=flow_operand_word(&ins.operands,0);
+    let object_id=flow_operand_word(&ins.operands,2);
+    if object_id & 0x8000 == 0 { return None; }
+    Some(sym.referenced_functions.get(index)
+        .cloned().unwrap_or_else(||format!("function-ref#{index}")))
+}
+
 fn inspect_connection_sites(
     parser: &PblParser, name: &str, body_index: usize
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1476,7 +1507,7 @@ fn inspect_connection_sites(
         println!("CONNECT #{} at 0x{:04X} USING {}",site_no+1,
             connect.position,transaction);
         println!("  Previous CONNECT: {}", if site_no==0 {"none"} else {"yes"});
-        let mut property_assigns=Vec::<(usize,String)>::new();
+        let mut property_assigns=Vec::<(usize,String,String,Vec<String>)>::new();
         let mut calls=Vec::<(usize,String)>::new();
         let mut literal_count=0usize;
         for (i,ins) in segment.iter().enumerate() {
@@ -1488,7 +1519,21 @@ fn inspect_connection_sites(
                     if let Some(prev)=i.checked_sub(1).and_then(|j|segment.get(j)) {
                         if prev.opcode==0x0020 {
                             let field=flow_field_name(&symbols,&prev.operands);
-                            property_assigns.push((ins.position,field));
+                            let metadata=field_descriptor_metadata(&symbols,&prev.operands);
+                            let mut associated_calls=Vec::new();
+                            // Only calls contained in this assignment expression;
+                            // do not associate all previous calls with the field.
+                            for part in segment.iter().skip(i+1) {
+                                if matches!(part.opcode,0x007f..=0x008c|
+                                    0x0104..=0x0118|0x0159|0x0205|0x0207..=0x0209)
+                                {
+                                    break;
+                                }
+                                if let Some(name)=referenced_function_at(&symbols,part) {
+                                    associated_calls.push(name);
+                                }
+                            }
+                            property_assigns.push((ins.position,field,metadata,associated_calls));
                         }
                     }
                 }
@@ -1509,7 +1554,7 @@ fn inspect_connection_sites(
         if property_assigns.is_empty() {
             println!("    none identified using direct BeginAssignInstanceVariable");
         }
-        for (offset,property) in &property_assigns {
+        for (offset,property,metadata,associated_calls) in &property_assigns {
             let category=match property.to_ascii_lowercase().as_str() {
                 "dbpass"|"logpass" => " [PASSWORD FIELD: value omitted]",
                 "userid"|"logid" => " [IDENTITY FIELD: value omitted]",
@@ -1517,6 +1562,10 @@ fn inspect_connection_sites(
                 _=>""
             };
             println!("    0x{offset:04X}  {property}{category}");
+            println!("      descriptor: {metadata}");
+            if !associated_calls.is_empty() {
+                println!("      calls inside assignment: {}",associated_calls.join(", "));
+            }
         }
         if !calls.is_empty() {
             println!("  Referenced functions before this CONNECT:");
@@ -1727,6 +1776,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+    #[test]
+    fn index_only_transaction_member_does_not_guess_name() {
+        let mut buffer = vec![0u8; 32];
+        buffer[8..12].copy_from_slice(&0x0000FFFFu32.to_le_bytes());
+        buffer[12..14].copy_from_slice(&123u16.to_le_bytes());
+        let symbols=FunctionSymbols {
+            code:Vec::new(),stack_buffer:buffer,
+            locals:Vec::new(),globals:Vec::new(),
+            referenced_functions:Vec::new(),sql_pool:Vec::new(),
+        };
+        let metadata=field_descriptor_metadata(&symbols,&8u16.to_le_bytes());
+        assert!(metadata.contains("type-indexed member=#123"));
+        assert!(!metadata.contains("DBPass"));
+    }
+
 
     #[test]
     fn reads_local_transaction_operand_for_connect() {
