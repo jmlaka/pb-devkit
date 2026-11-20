@@ -567,7 +567,9 @@ fn sql_with_bound_params(
     if params.is_empty() {return template;}
     let param_position=sql_cursor_record(sym,args).and_then(|off|{
         let pos=sym.sql_pool.get(off.checked_add(16)?..off.checked_add(20)?)?;
-        Some(u32::from_le_bytes([pos[0],pos[1],pos[2],pos[3]]) as usize)
+        // PB333 marks in-buffer offsets with 0x80000000; it is not part
+        // of the address (same convention as BufferHelper.GetCursor).
+        Some((u32::from_le_bytes([pos[0],pos[1],pos[2],pos[3]]) & 0x7FFF_FFFF) as usize)
     });
     match param_position {
         Some(pos)=>match substitute_sql_ranges(&template,&sym.sql_pool,pos,params) {
@@ -1531,6 +1533,38 @@ mod semantic_probe_tests {
 #[cfg(test)]
 mod sql_cursor_interpolation_tests {
     use super::*;
+
+    #[test]
+    fn resolves_high_bit_flagged_sql_placeholder_pointer() {
+        let template = "select * from T where a=' ' and b=' '";
+        let mut pool = vec![0u8; 1024];
+        // Terminal SQL cursor record at 0x10.
+        pool[0x18..0x1c].copy_from_slice(&65535u32.to_le_bytes());
+        pool[0x20..0x24].copy_from_slice(&0x8000_0060u32.to_le_bytes());
+        pool[0x28..0x2c].copy_from_slice(&0x8000_0100u32.to_le_bytes());
+        for (i, (start, _)) in template.match_indices("' '").enumerate() {
+            let start = start as u16; // fixture is ASCII: bytes == UTF-16 units
+            let pos = 0x60 + i * 4;
+            pool[pos..pos+2].copy_from_slice(&start.to_le_bytes());
+            pool[pos+2..pos+4].copy_from_slice(&(start + 3).to_le_bytes());
+        }
+        for (i, unit) in template.encode_utf16().enumerate() {
+            let pos = 0x100 + i * 2;
+            pool[pos..pos+2].copy_from_slice(&unit.to_le_bytes());
+        }
+        let symbols = FunctionSymbols {
+            code: Vec::new(), stack_buffer: Vec::new(),
+            locals: Vec::new(), globals: Vec::new(),
+            referenced_functions: Vec::new(), sql_pool: pool,
+        };
+        let sql = sql_with_bound_params(
+            &symbols, &0x8000_0010u32.to_le_bytes(),
+            &["rod_cis".to_string(), "kod_odd".to_string()], true,
+        );
+        assert_eq!(sql,
+            "select * from T where a=:rod_cis and b=:kod_odd");
+    }
+
 
     #[test]
     fn inserts_parameters_at_utf16_ranges() {
