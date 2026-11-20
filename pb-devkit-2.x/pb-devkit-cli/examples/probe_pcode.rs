@@ -646,12 +646,330 @@ fn annotated_opcode(
     }
 }
 
+
+// A deliberately limited, branch-aware stack translator. It produces a
+// pseudocode/control-flow outline, NOT guaranteed compilable PowerScript.
+// The simulator starts each basic block with an empty stack: any state that
+// must flow across blocks remains unresolved rather than being invented.
+#[derive(Clone)]
+struct FlowInsn {
+    position: usize,
+    end: usize,
+    opcode: u16,
+    operands: Vec<u8>,
+}
+
+fn flow_instructions(code: &[u8]) -> Result<Vec<FlowInsn>, String> {
+    let mut result = Vec::new();
+    let mut pos = 0usize;
+    while pos < code.len() {
+        let raw = code.get(pos..pos + 2)
+            .ok_or_else(|| format!("truncated opcode at 0x{pos:X}"))?;
+        let opcode = u16::from_le_bytes([raw[0], raw[1]]);
+        let words = *OPERAND_WORDS.get(opcode as usize)
+            .ok_or_else(|| format!("unknown opcode 0x{opcode:04X}"))? as usize;
+        let end = pos + 2 + 2 * words;
+        let operands = code.get(pos + 2..end)
+            .ok_or_else(|| format!("truncated operands at 0x{pos:X}"))?
+            .to_vec();
+        result.push(FlowInsn { position: pos, end, opcode, operands });
+        pos = end;
+    }
+    Ok(result)
+}
+
+fn flow_pop(stack: &mut Vec<String>) -> String {
+    stack.pop().unwrap_or_else(|| "<missing-stack-value>".to_string())
+}
+
+fn flow_pop_n(stack: &mut Vec<String>, count: usize) -> Vec<String> {
+    if count > stack.len() {
+        stack.clear();
+        return vec!["<missing-stack-values>".into()];
+    }
+    stack.split_off(stack.len() - count)
+}
+
+fn flow_local(sym: &FunctionSymbols, operand: &[u8]) -> String {
+    match operand_u16(operand).map(|x| x as usize) {
+        Some(i) => sym.locals.get(i)
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| format!("local[{i}]")),
+        None => "<invalid-local>".into(),
+    }
+}
+
+fn flow_global(sym: &FunctionSymbols, operand: &[u8]) -> String {
+    match operand_u16(operand) {
+        Some(i) => sym.locals.iter().chain(sym.globals.iter())
+            .find(|v| v.global_index == Some(i))
+            .map(|v| v.name.clone())
+            .unwrap_or_else(|| format!("global[{i}]")),
+        None => "<invalid-global>".into(),
+    }
+}
+
+fn flow_operand_word(raw: &[u8], start: usize) -> usize {
+    raw.get(start..start + 2).and_then(operand_u16)
+        .unwrap_or(0) as usize
+}
+
+fn flow_field_name(sym: &FunctionSymbols, operand: &[u8]) -> String {
+    let offset = operand_u16(operand).unwrap_or(0) as usize;
+    if offset >= 1 && offset <= 7 {
+        return "entryobject".into();
+    }
+    let location = sym.stack_buffer.get(offset..offset + 4);
+    if let Some(bytes) = location {
+        let name_offset = u32::from_le_bytes([bytes[0],bytes[1],bytes[2],bytes[3]]);
+        if let Some(name) = utf16_string(&sym.stack_buffer,name_offset) {
+            if !name.is_empty() && name.len() <= 128
+                && name.chars().all(|c| !c.is_control())
+            {
+                return name;
+            }
+        }
+    }
+    format!("field[0x{offset:X}]")
+}
+
+fn flow_statement(
+    ins: &FlowInsn,
+    sym: &FunctionSymbols,
+    stack: &mut Vec<String>,
+    reveal_strings: bool,
+) -> Option<String> {
+    let op = ins.opcode;
+    let p = &ins.operands;
+    match op {
+        0x001e | 0x01a9 | 0x0150 | 0x011d => {
+            stack.push(flow_local(sym, p));
+            None
+        }
+        0x002f => {
+            stack.push(flow_global(sym, p));
+            None
+        }
+        0x0034 => {
+            let value = operand_i32(p).map(|v| v.to_string())
+                .unwrap_or_else(|| "<invalid-integer>".into());
+            stack.push(value);
+            None
+        }
+        0x003b => {
+            let value = p.get(..4)
+                .and_then(|b| {
+                    let offset = u32::from_le_bytes([b[0],b[1],b[2],b[3]]);
+                    utf16_string(&sym.stack_buffer,offset)
+                });
+            let value = match value {
+                Some(s) if reveal_strings => {
+                    let mut escaped = s.replace('~',"~~")
+                        .replace('"',"~\"")
+                        .replace('\n',"~n")
+                        .replace('\r',"~r");
+                    if escaped.len() > 200 {
+                        escaped = escaped.chars().take(200).collect();
+                        escaped.push_str("...");
+                    }
+                    format!("\"{escaped}\"")
+                }
+                Some(_) => "<string-hidden>".into(),
+                None => "<string-offset-unresolved>".into(),
+            };
+            stack.push(value);
+            None
+        }
+        0x0195 => {
+            let x = flow_pop(stack);
+            stack.push(format!("IsNull({x})"));
+            None
+        }
+        0x00a8 | 0x00ad => {
+            let b=flow_pop(stack);
+            let a=flow_pop(stack);
+            stack.push(format!("({a} = {b})"));
+            None
+        }
+        0x0025 => {
+            let b=flow_pop(stack);
+            let a=flow_pop(stack);
+            stack.push(format!("({a} OR {b})"));
+            None
+        }
+        0x003f | 0x008e | 0x0133 | 0x013b | 0x0139 | 0x0129 => None, // cast = no-op per PbdViewer
+        0x0080 | 0x0082 | 0x0088 => {
+            let value=flow_pop(stack);
+            let variable=flow_pop(stack);
+            Some(format!("{variable} = {value}"))
+        }
+        0x00f8 => {
+            let variable=flow_pop(stack);
+            Some(format!("{variable}++"))
+        }
+        0x0020 => {
+            stack.push(flow_field_name(sym,p));
+            None
+        }
+        0x0027 => {
+            let field=flow_pop(stack);
+            let object=flow_pop(stack);
+            stack.push(if field=="entryobject" {
+                object
+            } else {
+                format!("{object}.{field}")
+            });
+            None
+        }
+        0x0010 => {
+            let sqlca=flow_pop(stack);
+            let params=flow_pop_n(stack,flow_operand_word(p,4));
+            let destinations=flow_pop_n(stack,flow_operand_word(p,6));
+            Some(format!(
+                "SQL SELECT <SQL text hidden> INTO :{} USING {}; INPUTS: {}",
+                destinations.join(", :"),sqlca,params.join(", ")
+            ))
+        }
+        0x000f => {
+            let sqlca=flow_pop(stack);
+            let params=flow_pop_n(stack,flow_operand_word(p,4));
+            Some(format!(
+                "SQL DML <SQL text hidden> USING {}; PARAMETERS: {}",
+                sqlca,params.join(", ")
+            ))
+        }
+        0x0006 => {
+            let sqlca=flow_pop(stack);
+            Some(format!("COMMIT USING {sqlca}"))
+        }
+        0x01bc => {
+            let function_index=flow_operand_word(p,0);
+            // For object ref 0x8001, this index is an entry in the
+            // referenced-functions table. The actual name is not yet resolved.
+            stack.push(format!("<global-function-ref#{function_index}>"));
+            None
+        }
+        0x01bd => {
+            let function=flow_pop(stack);
+            let params=flow_pop_n(stack,flow_operand_word(p,2));
+            stack.push(format!("{function}({})",params.join(", ")));
+            None
+        }
+        0x0014 => {
+            Some(format!("CALL {}",flow_pop(stack)))
+        }
+        0x0000 => Some("RETURN".into()),
+        0x0001 => {
+            let flag=flow_operand_word(p,0);
+            if flag == 1 {Some(format!("RETURN {}",flow_pop(stack)))}
+            else {Some("RETURN".into())}
+        }
+        0x0002 | 0x0003 => {
+            let condition=flow_pop(stack);
+            let target=flow_operand_word(p,0);
+            if op==0x0003 {
+                Some(format!("IF NOT {condition} GOTO L{target:04X}"))
+            } else {
+                Some(format!("IF {condition} GOTO L{target:04X}"))
+            }
+        }
+        0x0004 => {
+            let target=flow_operand_word(p,0);
+            Some(format!("GOTO L{target:04X}"))
+        }
+        _ => {
+            // Do not guess its stack effect; warn and abandon any pending
+            // expressions in the current basic block.
+            stack.clear();
+            Some(format!(
+                "/* unknown stack semantics: 0x{:04X} {} */",
+                op, opcode_action(op)
+            ))
+        }
+    }
+}
+
+fn print_flow(sym: &FunctionSymbols, reveal_strings: bool)
+    -> Result<(), String>
+{
+    use std::collections::{BTreeMap, BTreeSet};
+    let lines = flow_instructions(&sym.code)?;
+    let mut by_offset = BTreeMap::<usize, usize>::new();
+    for (i, ins) in lines.iter().enumerate() {
+        by_offset.insert(ins.position,i);
+    }
+    let mut starts = BTreeSet::new();
+    starts.insert(0usize);
+    for ins in &lines {
+        if matches!(ins.opcode,0x0002|0x0003|0x0004) {
+            let target=flow_operand_word(&ins.operands,0);
+            if !by_offset.contains_key(&target) {
+                return Err(format!(
+                    "jump at 0x{:04X} targets 0x{:04X}, not an instruction boundary",
+                    ins.position,target
+                ));
+            }
+            starts.insert(target);
+            if ins.end < sym.code.len() { starts.insert(ins.end); }
+        } else if matches!(ins.opcode,0x0000|0x0001) && ins.end < sym.code.len() {
+            starts.insert(ins.end);
+        }
+    }
+    let ordered: Vec<usize> = starts.into_iter().collect();
+    let mut blocks = Vec::new();
+    for (i,start) in ordered.iter().enumerate() {
+        let end=ordered.get(i+1).copied().unwrap_or(sym.code.len());
+        blocks.push((*start,end));
+    }
+
+    let mut reachable = BTreeSet::new();
+    let mut todo = vec![0usize];
+    while let Some(start) = todo.pop() {
+        if !reachable.insert(start) { continue; }
+        let Some((_,end))=blocks.iter().copied().find(|(b,_)| *b==start)
+        else { return Err(format!("block at 0x{start:X} not found")); };
+        let Some(last)=lines.iter().filter(|l| l.position>=start && l.end<=end).last()
+        else { continue; };
+        match last.opcode {
+            0x0000 | 0x0001 => {}
+            0x0004 => { todo.push(flow_operand_word(&last.operands,0)); }
+            0x0002 | 0x0003 => {
+                todo.push(flow_operand_word(&last.operands,0));
+                if end < sym.code.len() { todo.push(end); }
+            }
+            _ => {
+                if end < sym.code.len() {todo.push(end);}
+            }
+        }
+    }
+
+    println!("\n=== CONSERVATIVE CONTROL-FLOW OUTLINE ===");
+    println!("Blocks: {} | reachable: {} | unreachable: {}",
+        blocks.len(), reachable.len(), blocks.len()-reachable.len());
+    println!("Warning: per-block stack is reset; SQL text and function references are unresolved.");
+    for (start,end) in blocks {
+        let annotation=if reachable.contains(&start) {""} else {" [UNREACHABLE]"};
+        println!("\nL{start:04X}:{annotation}  // 0x{start:04X}..0x{end:04X}");
+        let mut stack=Vec::new();
+        for ins in lines.iter().filter(|l| l.position>=start && l.end<=end) {
+            if let Some(stmt)=flow_statement(ins,sym,&mut stack,reveal_strings) {
+                println!("    {stmt}    // 0x{:04X}",ins.position);
+            }
+        }
+        if !stack.is_empty() {
+            println!("    /* {} expression(s) remain on stack */",stack.len());
+        }
+    }
+    Ok(())
+}
+
 fn disassemble_one(
     parser: &PblParser,
     name: &str,
     body_index: usize,
     limit: usize,
     show_strings: bool,
+    show_flow: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entry = parser.entries().iter()
         .find(|e| e.name.eq_ignore_ascii_case(name)
@@ -707,6 +1025,7 @@ fn disassemble_one(
         println!("\nNo source-level preview: this body requires stack/control-flow analysis.");
     }
     println!("Note: most operands remain raw numbers, not resolved variable names or literals.");
+    if show_flow { print_flow(&symbols,show_strings)?; }
     Ok(())
 }
 
@@ -714,16 +1033,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Optional mode: <name.fun> [body_index=0] [max_instructions=80]
     if !args.is_empty() {
-        if args.len() > 4 || (args.len() == 4 && args[3] != "--strings") {
-            return Err("usage: probe_pcode [name.fun [body_index [max_instructions [--strings]]]]".into());
+        if args.len() > 5 || args.iter().skip(3).any(|x| x != "--flow" && x != "--strings") {
+            return Err("usage: probe_pcode [name.fun [body_index [max_instructions [--flow] [--strings]]]]".into());
         }
         let body_index = args.get(1).map(|s| s.parse::<usize>())
             .transpose()?.unwrap_or(0);
         let limit = args.get(2).map(|s| s.parse::<usize>())
             .transpose()?.unwrap_or(80).min(1000);
-        let show_strings = args.get(3).map(|s| s == "--strings").unwrap_or(false);
+        let show_strings = args.iter().skip(3).any(|s| s == "--strings");
+        let show_flow = args.iter().skip(3).any(|s| s == "--flow");
         let parser = PblParser::new(EXE)?;
-        return disassemble_one(&parser, &args[0], body_index, limit, show_strings);
+        return disassemble_one(&parser, &args[0], body_index, limit, show_strings, show_flow);
     }
     let parser = PblParser::new(EXE)?;
     let mut total_objects = 0usize;
