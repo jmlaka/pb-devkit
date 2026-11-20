@@ -327,81 +327,6 @@ fn opcode_action(op: u16) -> &'static str {
 }
 
 
-// Extract a chosen P-code body from an already-validated PB333 .fun entry.
-// Body indices are zero-based and count all bodies inside the entry.
-fn find_pcode_body(data: &[u8], selected: usize) -> Result<Vec<u8>, String> {
-    let mut r = Cursor::new(data);
-    if r.u16()? != 333 {
-        return Err("not a version-333 compiled entry".into());
-    }
-    r.bytes(22)?;
-    let descriptor_count = r.u16()? as usize;
-    r.bytes(descriptor_count * 12)?;
-    r.struct_buffer()?;
-    r.records20()?;
-    let object_count = r.u16()? as usize;
-    let extended_count = r.u16()? as usize;
-    r.struct_buffer()?;
-    r.struct_buffer()?;
-    r.records20()?;
-    r.records20()?;
-
-    let object_indices = r.bytes(object_count * 16)?;
-    let extended_headers = r.bytes(extended_count * 32)?;
-    let mut extended_used = 0usize;
-    let mut body_index = 0usize;
-
-    for object in object_indices.chunks_exact(16) {
-        match (object[0] >> 1) & 7 {
-            0 => {
-                let header_start = extended_used * 32;
-                let header = extended_headers.get(header_start..header_start + 32)
-                    .ok_or_else(|| "missing extended object header".to_string())?;
-                extended_used += 1;
-
-                let bodies = r.u16()? as usize;
-                r.bytes(bodies * 4)?;
-                let mut selected_data: Option<FunctionSymbols> = None;
-                for _ in 0..bodies {
-                    let code_length = r.u16()? as usize;
-                    let debug_count = r.u16()? as usize;
-                    r.u16()?;
-                    let code = r.bytes(code_length)?;
-                    if body_index == selected {
-                        return Ok(code.to_vec());
-                    }
-                    body_index += 1;
-                    r.bytes(debug_count * 4)?;
-                    r.records20()?;
-                    r.struct_buffer()?;
-                }
-
-                r.bytes(word(header, 24)? * 6)?;
-                r.bytes(word(header, 22)? * 4)?;
-                let references = named_references(&mut r)?;
-                if let Some(mut data) = selected_data {
-                    data.referenced_functions = references;
-                    return Ok(data);
-                }
-                r.records20()?;
-                r.bytes(word(header, 28)? * 8)?;
-                r.bytes(word(header, 26)? * 16)?;
-                r.bytes(word(header, 4)? * 48)?;
-            }
-            1 => {
-                r.bytes(word(object, 4)? * 8)?;
-            }
-            _ => {}
-        }
-    }
-
-    Err(format!(
-        "P-code body index {} not found (available: 0..{})",
-        selected, body_index
-    ))
-}
-
-
 // These annotations are intentionally narrow and correspond to specific PB333
 // opcode cases from PbdViewer's version conversion and PCodeParser90/105:
 // 0x0034 -> PushConstant((int32) operand), 0x0001 -> Return(flag),
@@ -617,6 +542,7 @@ fn find_pcode_symbols(data: &[u8], selected: usize) -> Result<FunctionSymbols, S
                 used_extended += 1;
                 let bodies = r.u16()? as usize;
                 r.bytes(bodies * 4)?;
+                let mut selected_data: Option<FunctionSymbols> = None;
                 for _ in 0..bodies {
                     let code_len = r.u16()? as usize;
                     let debug_count = r.u16()? as usize;
@@ -641,7 +567,11 @@ fn find_pcode_symbols(data: &[u8], selected: usize) -> Result<FunctionSymbols, S
 
                 r.bytes(word(header, 24)? * 6)?;
                 r.bytes(word(header, 22)? * 4)?;
-                r.records20()?;
+                let referenced_functions = named_references(&mut r)?;
+                if let Some(mut data) = selected_data {
+                    data.referenced_functions = referenced_functions;
+                    return Ok(data);
+                }
                 r.records20()?;
                 r.bytes(word(header, 28)? * 8)?;
                 r.bytes(word(header, 26)? * 16)?;
@@ -714,8 +644,6 @@ fn annotated_opcode(
         0x0025 => "logical OR".into(),
         0x00f8 => "increment variable (++)".into(),
         0x0006 => "SQL COMMIT".into(),
-        0x0010 => "SQL SELECT".into(),
-        0x000f => "SQL DML (insert/update/delete), variant unresolved".into(),
         _ => opcode_note(opcode, operands),
     }
 }
