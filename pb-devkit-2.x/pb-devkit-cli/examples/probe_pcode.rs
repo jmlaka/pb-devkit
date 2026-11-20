@@ -478,24 +478,31 @@ fn named_references(r: &mut Cursor<'_>) -> Result<Vec<String>, String> {
     }).collect())
 }
 
-fn sql_template(sym: &FunctionSymbols, args: &[u8]) -> Option<String> {
-    // Adaptation of PbdViewer BufferHelper.GetCursor: follow linked cursor
-    // records using +8 until u32(0xFFFF), then read UTF-16 text at +24.
+// PbdViewer BufferHelper.GetCursor walks a link at +8 until 0xFFFF.
+// A terminal cursor record has the template offset at +24 and the list of
+// (start, end) UTF-16 *code unit* placeholder ranges at +16.
+// We use the ranges, never blind string replacement, so repeated parameter
+// names and non-ASCII text retain their original meaning.
+fn sql_cursor_record(sym: &FunctionSymbols, args: &[u8]) -> Option<usize> {
     let raw = args.get(0..4)?;
-    let mut off = (u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]) & 0x7fff_ffff) as usize;
+    let mut off = (u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]])
+        & 0x7fff_ffff) as usize;
     for _ in 0..32 {
         let next = sym.sql_pool.get(off.checked_add(8)?..off.checked_add(12)?)?;
         let ptr = u32::from_le_bytes([next[0],next[1],next[2],next[3]]);
         if ptr == 65535 {
-            let text_pos = sym.sql_pool.get(off.checked_add(24)?..off.checked_add(28)?)?;
-            let text_offset = u32::from_le_bytes([
-                text_pos[0],text_pos[1],text_pos[2],text_pos[3]
-            ]);
-            return utf16_string(&sym.sql_pool,text_offset);
+            return Some(off);
         }
-        off=(ptr & 0x7fff_ffff) as usize;
+        off = (ptr & 0x7fff_ffff) as usize;
     }
     None
+}
+
+fn sql_template(sym: &FunctionSymbols, args: &[u8]) -> Option<String> {
+    let off = sql_cursor_record(sym,args)?;
+    let pos = sym.sql_pool.get(off.checked_add(24)?..off.checked_add(28)?)?;
+    let text_offset = u32::from_le_bytes([pos[0],pos[1],pos[2],pos[3]]);
+    utf16_string(&sym.sql_pool,text_offset)
 }
 
 fn sql_info(sym: &FunctionSymbols, args: &[u8], reveal: bool) -> String {
@@ -508,6 +515,78 @@ fn sql_info(sym: &FunctionSymbols, args: &[u8], reveal: bool) -> String {
         }
         Some(text) => format!("<SQL template hidden, {} chars; use --strings>",text.chars().count()),
         None => "<SQL template not resolved>".into(),
+    }
+}
+
+fn substitute_sql_ranges(
+    template: &str,
+    pool: &[u8],
+    positions: usize,
+    params: &[String],
+) -> Result<String, String> {
+    let units: Vec<u16> = template.encode_utf16().collect();
+    let mut out: Vec<u16> = Vec::with_capacity(units.len() + params.len() * 12);
+    let mut consumed = 0usize;
+    for (i,param) in params.iter().enumerate() {
+        let record=positions.checked_add(i.checked_mul(4)
+            .ok_or("parameter table offset overflow")?)
+            .ok_or("parameter table offset overflow")?;
+        let pair=pool.get(record..record.checked_add(4)
+            .ok_or("parameter table range overflow")?)
+            .ok_or("parameter table exceeds cursor buffer")?;
+        let start=u16::from_le_bytes([pair[0],pair[1]]) as usize;
+        let end=u16::from_le_bytes([pair[2],pair[3]]) as usize;
+        if start==0 && end==0 {
+            return Err(format!("placeholder table ended before parameter {}",i+1));
+        }
+        if start<consumed || end<start || end>units.len() {
+            return Err(format!(
+                "invalid placeholder span {}..{} for parameter {} (UTF-16 length {})",
+                start,end,i+1,units.len()
+            ));
+        }
+        out.extend_from_slice(&units[consumed..start]);
+        out.extend(format!(":{param}").encode_utf16());
+        consumed=end;
+    }
+    out.extend_from_slice(&units[consumed..]);
+    String::from_utf16(&out).map_err(|_| "invalid UTF-16 placeholder substitution".into())
+}
+
+fn sql_with_bound_params(
+    sym: &FunctionSymbols,
+    args: &[u8],
+    params: &[String],
+    reveal: bool,
+) -> String {
+    if !reveal { return sql_info(sym,args,false); }
+    let template=match sql_template(sym,args) {
+        Some(value)=>value,
+        None=>return "<SQL template not resolved>".into(),
+    };
+    if params.is_empty() {return template;}
+    let param_position=sql_cursor_record(sym,args).and_then(|off|{
+        let pos=sym.sql_pool.get(off.checked_add(16)?..off.checked_add(20)?)?;
+        Some(u32::from_le_bytes([pos[0],pos[1],pos[2],pos[3]]) as usize)
+    });
+    match param_position {
+        Some(pos)=>match substitute_sql_ranges(&template,&sym.sql_pool,pos,params) {
+            Ok(bound)=>bound,
+            Err(err)=>format!("/* SQL placeholder substitution refused: {err} */ {template}"),
+        },
+        None=>format!("/* SQL placeholder table not found */ {template}"),
+    }
+}
+
+fn sql_with_into(mut statement: String, destinations: &[String], reveal: bool) -> String {
+    if !reveal {return statement;}
+    let lower=statement.to_ascii_lowercase();
+    if let Some(pos)=lower.find(" from ") {
+        let insertion=format!(" INTO :{}",destinations.join(", :"));
+        statement.insert_str(pos,&insertion);
+        statement
+    } else {
+        format!("/* SELECT INTO not inserted: FROM not found */ {statement}")
     }
 }
 
@@ -827,18 +906,31 @@ fn flow_statement(
             let sqlca=flow_pop(stack);
             let params=flow_pop_n(stack,flow_operand_word(p,4));
             let destinations=flow_pop_n(stack,flow_operand_word(p,6));
-            Some(format!(
-                "SQL SELECT {} INTO :{} USING {}; INPUTS: {}",
-                sql_info(sym,p,reveal_strings),destinations.join(", :"),sqlca,params.join(", ")
-            ))
+            let query=sql_with_into(
+                sql_with_bound_params(sym,p,&params,reveal_strings),
+                &destinations,reveal_strings
+            );
+            if reveal_strings {
+                Some(format!("{} USING {}",query,sqlca))
+            } else {
+                Some(format!(
+                    "SQL SELECT {} INTO :{} USING {}; INPUTS: {}",
+                    query,destinations.join(", :"),sqlca,params.join(", ")
+                ))
+            }
         }
         0x000f => {
             let sqlca=flow_pop(stack);
             let params=flow_pop_n(stack,flow_operand_word(p,4));
-            Some(format!(
-                "SQL DML {} USING {}; PARAMETERS: {}",
-                sql_info(sym,p,reveal_strings),sqlca,params.join(", ")
-            ))
+            let query=sql_with_bound_params(sym,p,&params,reveal_strings);
+            if reveal_strings {
+                Some(format!("{} USING {}",query,sqlca))
+            } else {
+                Some(format!(
+                    "SQL DML {} USING {}; PARAMETERS: {}",
+                    query,sqlca,params.join(", ")
+                ))
+            }
         }
         0x0006 => {
             let sqlca=flow_pop(stack);
@@ -1374,5 +1466,50 @@ mod semantic_probe_tests {
             0x00, 0x00,
         ];
         assert_eq!(simple_constant_return(&bytes), None);
+    }
+}
+
+
+#[cfg(test)]
+mod sql_cursor_interpolation_tests {
+    use super::*;
+
+    #[test]
+    fn inserts_parameters_at_utf16_ranges() {
+        // The original SQL contains two placeholder spans (question marks).
+        // These positions are UTF-16 units, as in PbdViewer GetCursor().
+        let original="select č from T where a=? and b=?";
+        let utf16: Vec<u16>=original.encode_utf16().collect();
+        let marks: Vec<usize>=utf16.iter().enumerate()
+            .filter_map(|(index,&unit)| (unit==b'?' as u16).then_some(index))
+            .collect();
+        assert_eq!(marks.len(),2);
+        let mut pool=Vec::new();
+        for m in marks {
+            pool.extend_from_slice(&(m as u16).to_le_bytes());
+            pool.extend_from_slice(&((m+1) as u16).to_le_bytes());
+        }
+        let sql=substitute_sql_ranges(
+            original,&pool,0,&["gch_rod_cis".into(),"gch_kod_odd".into()]
+        ).unwrap();
+        assert_eq!(sql,
+            "select č from T where a=:gch_rod_cis and b=:gch_kod_odd");
+    }
+
+    #[test]
+    fn rejects_malformed_parameter_ranges() {
+        let params=["x".to_string()];
+        assert!(substitute_sql_ranges("SELECT ?", &[0,0,0,0], 0, &params).is_err());
+        assert!(substitute_sql_ranges("SELECT ?", &[99,0,100,0], 0, &params).is_err());
+    }
+
+    #[test]
+    fn inserts_select_into_before_from_case_insensitively() {
+        let src="SELECT val FROM tab WHERE x=:x".into();
+        let result=sql_with_into(src,&["ll_riadok".into()],true);
+        assert_eq!(result,
+            "SELECT val INTO :ll_riadok FROM tab WHERE x=:x");
+        assert_eq!(sql_with_into("SELECT val FROM tab".into(),&[],false),
+            "SELECT val FROM tab");
     }
 }
