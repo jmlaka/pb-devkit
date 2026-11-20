@@ -1776,6 +1776,121 @@ fn transaction_catalog_scan(parser:&PblParser) -> Result<(),Box<dyn std::error::
     Ok(())
 }
 
+
+// Infer transaction property member names from *explicitly named* field
+// descriptors in other compiled code. An index-only descriptor is NOT
+// evidence of any name. Only type-checked transaction object assignments
+// are considered; all literal values and connection strings are ignored.
+fn transaction_field_evidence(parser:&PblParser)
+    -> Result<(),Box<dyn std::error::Error>>
+{
+    use std::collections::{BTreeMap,BTreeSet};
+    println!("=== TRANSACTION PROPERTY NAME EVIDENCE (REDACTED) ===");
+    println!("Searches only descriptor names, not assigned values or strings.\n");
+    let mut examined_entries=0usize;
+    let mut examined_bodies=0usize;
+    let mut typed_assignments=0usize;
+    let mut index_only=BTreeMap::<u16,usize>::new();
+    let mut named=BTreeMap::<u16,BTreeSet<String>>::new();
+    let mut parse_errors=0usize;
+    for entry in parser.entries().iter().filter(|e|{
+        let n=e.name.to_ascii_lowercase();
+        [".fun",".win",".udo",".apl"].iter().any(|ext|n.ends_with(ext))
+    }) {
+        let data=match parser.parse_chunk_chain(entry.data_offset,entry.size) {
+            Ok(bytes)=>bytes,
+            Err(_)=>{parse_errors+=1;continue;}
+        };
+        let inspection=match inspect(&data) {
+            Ok(inspection) if inspection.problems.is_empty() &&
+                inspection.decoded_bodies==inspection.bodies =>inspection,
+            _=>{parse_errors+=1;continue;}
+        };
+        if !inspection.opcode_counts.contains_key(&0x0020) ||
+            !inspection.opcode_counts.contains_key(&0x0122) {continue;}
+        examined_entries+=1;
+        for body in 0..inspection.bodies {
+            let symbols=match find_pcode_symbols(&data,body) {
+                Ok(value)=>value,
+                Err(_)=>{parse_errors+=1;continue;}
+            };
+            examined_bodies+=1;
+            let lines=flow_instructions(&symbols.code)?;
+            for triple in lines.windows(3) {
+                let object=&triple[0];
+                let field=&triple[1];
+                let assign=&triple[2];
+                if field.opcode!=0x0020 || assign.opcode!=0x0122 {continue;}
+                let source=match object.opcode {
+                    0x001e|0x0030|0x01a9|0x0150 => {
+                        let idx=flow_operand_word(&object.operands,0);
+                        symbols.locals.get(idx)
+                    }
+                    0x002f => {
+                        let idx=flow_operand_word(&object.operands,0) as u16;
+                        symbols.locals.iter().chain(symbols.globals.iter())
+                            .find(|v|v.global_index==Some(idx))
+                    }
+                    _=>None,
+                };
+                let Some(var)=source else {continue;};
+                // Locally described transaction type, not unrelated objects
+                // that reuse the same member number.
+                let local_type=var.type_id;
+                let type_name=if local_type & 0xF000==0x8000 {
+                    symbols.type_names.get((local_type&0x3fff) as usize)
+                } else {None};
+                if !type_name.map(|n|n.eq_ignore_ascii_case("transaction"))
+                    .unwrap_or(false) {continue;}
+                let Some(offset)=operand_u16(&field.operands).map(usize::from)
+                    else {continue;};
+                let Some(raw)=symbols.stack_buffer.get(offset..offset.saturating_add(6))
+                    else {continue;};
+                typed_assignments+=1;
+                let word=u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+                let index=u16::from_le_bytes([raw[4],raw[5]]);
+                if word&0xffff==65535 {
+                    *index_only.entry(index).or_insert(0)+=1;
+                    continue;
+                }
+                // This is the safe evidence: the compiler stored both a
+                // descriptor index and an inline system property name.
+                if let Some(name)=utf16_string(&symbols.stack_buffer,word) {
+                    if !name.is_empty() && name.len()<100 &&
+                        name.chars().all(|c|
+                            c.is_ascii_alphanumeric() || c=='_')
+                    {
+                        named.entry(index).or_default().insert(name);
+                    }
+                }
+            }
+        }
+    }
+    println!("Entries examined with assignment opcodes: {}",examined_entries);
+    println!("Bodies decoded: {}",examined_bodies);
+    println!("Typed transaction assignments examined: {}",typed_assignments);
+    println!("Parsing errors: {}",parse_errors);
+    for index in [2u16,14,15] {
+        let known=named.get(&index);
+        let samples=index_only.get(&index).copied().unwrap_or(0);
+        match known {
+            Some(names) if names.len()==1 =>println!(
+                "member #{index}: {} [explicit inline-name evidence]; index-only occurrences: {samples}",
+                names.iter().next().unwrap()
+            ),
+            Some(names) =>println!(
+                "member #{index}: CONFLICTING explicit names {}; index-only occurrences: {samples}",
+                names.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+            None=>println!(
+                "member #{index}: no inline-name evidence; index-only occurrences: {samples}"
+            ),
+        }
+    }
+    println!("No index-to-property guessing is performed.");
+    Ok(())
+}
+
 fn disassemble_one(
     parser: &PblParser,
     name: &str,
@@ -1848,6 +1963,13 @@ fn disassemble_one(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|arg|arg=="--transaction-field-evidence").unwrap_or(false) {
+        if args.len()!=1 {
+            return Err("usage: probe_pcode --transaction-field-evidence".into());
+        }
+        let parser=PblParser::new(EXE)?;
+        return transaction_field_evidence(&parser);
+    }
     if args.first().map(|arg|arg=="--transaction-catalog").unwrap_or(false) {
         if args.len()!=1 {return Err("usage: probe_pcode --transaction-catalog".into());}
         let parser=PblParser::new(EXE)?;
