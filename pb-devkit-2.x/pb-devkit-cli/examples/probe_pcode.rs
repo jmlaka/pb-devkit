@@ -1351,7 +1351,7 @@ fn scan_db_connections(parser: &PblParser) -> Result<(), Box<dyn std::error::Err
     println!("Target opcode: 0x0005 = CONNECT USING <transaction>");
     println!("No literal strings, parameter values or credentials will be printed.\n");
     for entry in parser.entries().iter()
-        .filter(|e| SUFFIXES.iter().any(|ext| e.name.to_ascii_lowercase().ends_with(ext)))
+        .filter(|e| SUFFIXES.iter().any(|ext| e.name.to_ascii_lowercase().ends_with(*ext)))
     {
         seen += 1;
         let name=entry.name.to_ascii_lowercase();
