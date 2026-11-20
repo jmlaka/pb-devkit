@@ -1041,6 +1041,210 @@ fn print_flow(sym: &FunctionSymbols, reveal_strings: bool)
     Ok(())
 }
 
+
+// Forward-only control-flow structurer. Deliberately refuses to structure
+// reachable unconditional jumps or backward branches, rather than emitting
+// invalid PowerScript. Expected to work with the simple branch/return CFG
+// in w_f_zapis_vykon_neplateny_cash.fun.
+#[derive(Clone, Copy, Debug)]
+struct StructuredBlock {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy)]
+enum BranchScope {
+    Join(usize),        // IF...END IF closes at shared successor
+    Else(usize),        // IF...ELSE changes arm at second successor
+    ElseBody,           // END IF after both branches terminate
+}
+
+fn flow_has_path(
+    successors: &std::collections::BTreeMap<usize, Vec<usize>>,
+    start: usize,
+    target: usize,
+) -> bool {
+    let mut visited=std::collections::BTreeSet::new();
+    let mut todo=vec![start];
+    while let Some(here)=todo.pop() {
+        if here==target {return true;}
+        if !visited.insert(here) {continue;}
+        if let Some(next)=successors.get(&here) {
+            todo.extend(next.iter().copied());
+        }
+    }
+    false
+}
+
+fn print_structured(sym: &FunctionSymbols, reveal_strings: bool)
+    -> Result<(), String>
+{
+    use std::collections::{BTreeMap,BTreeSet};
+    let lines=flow_instructions(&sym.code)?;
+    if lines.is_empty() {
+        println!("\n=== STRUCTURED POWERSCRIPT OUTLINE ===\n/* empty P-code */");
+        return Ok(());
+    }
+
+    let instructions: BTreeSet<usize>=lines.iter().map(|i|i.position).collect();
+    let mut starts=BTreeSet::new();
+    starts.insert(0usize);
+    for ins in &lines {
+        if matches!(ins.opcode,0x0002|0x0003|0x0004) {
+            let target=flow_operand_word(&ins.operands,0);
+            if !instructions.contains(&target) {
+                return Err(format!("invalid branch target 0x{:04X}",target));
+            }
+            starts.insert(target);
+            if ins.end < sym.code.len() {starts.insert(ins.end);}
+        } else if matches!(ins.opcode,0x0000|0x0001) && ins.end < sym.code.len() {
+            starts.insert(ins.end);
+        }
+    }
+    let labels: Vec<_>=starts.into_iter().collect();
+    let blocks: Vec<_>=labels.iter().enumerate().map(|(i,&start)|{
+        StructuredBlock {
+            start,
+            end: labels.get(i+1).copied().unwrap_or(sym.code.len())
+        }
+    }).collect();
+
+    let mut successors=BTreeMap::<usize,Vec<usize>>::new();
+    let mut terminal=BTreeMap::<usize,FlowInsn>::new();
+    for block in &blocks {
+        let last=lines.iter().filter(|ins|
+            ins.position>=block.start && ins.end<=block.end
+        ).last().ok_or_else(||format!("empty block at 0x{:X}",block.start))?;
+        terminal.insert(block.start,last.clone());
+        let next=match last.opcode {
+            0x0000 | 0x0001 => Vec::new(),
+            0x0004 => vec![flow_operand_word(&last.operands,0)],
+            0x0002 | 0x0003 => {
+                let mut value=vec![flow_operand_word(&last.operands,0)];
+                if block.end<sym.code.len() {value.push(block.end);}
+                value
+            }
+            _ if block.end < sym.code.len()=>vec![block.end],
+            _ => Vec::new()
+        };
+        successors.insert(block.start,next);
+    }
+
+    let mut reachable=BTreeSet::new();
+    let mut todo=vec![0usize];
+    while let Some(start)=todo.pop() {
+        if !reachable.insert(start) {continue;}
+        let children=successors.get(&start)
+            .ok_or_else(||format!("missing basic block at 0x{:X}",start))?;
+        todo.extend(children.iter().copied());
+    }
+    let active: Vec<_>=blocks.into_iter()
+        .filter(|b| reachable.contains(&b.start)).collect();
+    for block in &active {
+        let last=terminal.get(&block.start)
+            .ok_or("missing block terminator")?;
+        if last.opcode==0x0004 {
+            return Err(format!(
+                "reachable unconditional goto at 0x{:04X}; use --flow",
+                last.position
+            ));
+        }
+        if matches!(last.opcode,0x0002|0x0003) {
+            let target=flow_operand_word(&last.operands,0);
+            if target<=block.end || !reachable.contains(&target) {
+                return Err(format!(
+                    "backward or unstructured branch at 0x{:04X}; use --flow",
+                    last.position
+                ));
+            }
+        }
+    }
+
+    println!("\n=== STRUCTURED POWERSCRIPT OUTLINE (EXPERIMENTAL) ===");
+    println!("Reachable basic blocks: {} / {}",active.len(),successors.len());
+    println!("Pseudocode; unresolved SQL text is hidden and function types are not inferred.");
+    let mut scopes=Vec::<BranchScope>::new();
+    let mut indent=0usize;
+    for block in &active {
+        // Closing a nested IF may reveal the start of the ELSE arm
+        // of an enclosing IF at the very same block boundary.
+        loop {
+            let Some(scope)=scopes.last().copied() else {break;};
+            match scope {
+                BranchScope::Join(target) if target==block.start => {
+                    scopes.pop();
+                    indent=indent.saturating_sub(1);
+                    println!("{}END IF", "    ".repeat(indent));
+                }
+                BranchScope::Else(target) if target==block.start => {
+                    indent=indent.saturating_sub(1);
+                    println!("{}ELSE", "    ".repeat(indent));
+                    indent+=1;
+                    *scopes.last_mut().expect("scope exists")=BranchScope::ElseBody;
+                }
+                _ => break,
+            }
+        }
+
+        let mut stack=Vec::new();
+        let in_block=lines.iter()
+            .filter(|ins|ins.position>=block.start && ins.end<=block.end);
+        for ins in in_block {
+            if matches!(ins.opcode,0x0002|0x0003) {
+                let condition=flow_pop(&mut stack);
+                let positive=if ins.opcode==0x0003 {
+                    condition
+                } else {
+                    format!("NOT ({condition})")
+                };
+                let false_target=flow_operand_word(&ins.operands,0);
+                let is_join=flow_has_path(&successors,block.end,false_target);
+                // Only one open ELSE branch is supported so far;
+                // this avoids silently emitting misnested scopes.
+                if !is_join && scopes.iter().any(|s|
+                    matches!(s,BranchScope::Else(_)|BranchScope::ElseBody))
+                {
+                    return Err(format!(
+                        "nested else detected at 0x{:04X}; use --flow",
+                        ins.position
+                    ));
+                }
+                println!("{}IF {} THEN", "    ".repeat(indent),positive);
+                scopes.push(if is_join {
+                    BranchScope::Join(false_target)
+                } else {
+                    BranchScope::Else(false_target)
+                });
+                indent+=1;
+            } else if ins.opcode==0x0004 {
+                // Reachable unconditional jumps were rejected above.
+                return Err("unstructured unconditional jump".into());
+            } else if let Some(stmt)=flow_statement(ins,sym,&mut stack,reveal_strings) {
+                println!("{}{}", "    ".repeat(indent),stmt);
+            }
+        }
+        if !stack.is_empty() {
+            println!("{}/* {} unresolved stack expression(s) */",
+                "    ".repeat(indent),stack.len());
+        }
+    }
+
+    while let Some(scope)=scopes.pop() {
+        match scope {
+            BranchScope::ElseBody => {
+                indent=indent.saturating_sub(1);
+                println!("{}END IF","    ".repeat(indent));
+            }
+            BranchScope::Join(target) | BranchScope::Else(target) => {
+                return Err(format!(
+                    "unclosed branch at target L{target:04X}; use --flow"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn disassemble_one(
     parser: &PblParser,
     name: &str,
@@ -1048,6 +1252,7 @@ fn disassemble_one(
     limit: usize,
     show_strings: bool,
     show_flow: bool,
+    show_structured: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entry = parser.entries().iter()
         .find(|e| e.name.eq_ignore_ascii_case(name)
@@ -1104,6 +1309,7 @@ fn disassemble_one(
     }
     println!("Note: most operands remain raw numbers, not resolved variable names or literals.");
     if show_flow { print_flow(&symbols,show_strings)?; }
+    if show_structured { print_structured(&symbols,show_strings)?; }
     Ok(())
 }
 
@@ -1111,8 +1317,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Optional mode: <name.fun> [body_index=0] [max_instructions=80]
     if !args.is_empty() {
-        if args.len() > 5 || args.iter().skip(3).any(|x| x != "--flow" && x != "--strings") {
-            return Err("usage: probe_pcode [name.fun [body_index [max_instructions [--flow] [--strings]]]]".into());
+        if args.len() > 6 || args.iter().skip(3).any(|x|
+            x != "--flow" && x != "--strings" && x != "--structured"
+        ) {
+            return Err("usage: probe_pcode [name.fun [body_index [max_instructions [--flow] [--structured] [--strings]]]]".into());
         }
         let body_index = args.get(1).map(|s| s.parse::<usize>())
             .transpose()?.unwrap_or(0);
@@ -1120,8 +1328,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .transpose()?.unwrap_or(80).min(1000);
         let show_strings = args.iter().skip(3).any(|s| s == "--strings");
         let show_flow = args.iter().skip(3).any(|s| s == "--flow");
+        let show_structured = args.iter().skip(3).any(|s| s == "--structured");
         let parser = PblParser::new(EXE)?;
-        return disassemble_one(&parser, &args[0], body_index, limit, show_strings, show_flow);
+        return disassemble_one(&parser, &args[0], body_index, limit,
+                               show_strings, show_flow, show_structured);
     }
     let parser = PblParser::new(EXE)?;
     let mut total_objects = 0usize;
