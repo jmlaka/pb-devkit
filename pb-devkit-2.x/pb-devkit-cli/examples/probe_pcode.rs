@@ -731,7 +731,7 @@ fn annotated_opcode(
     show_strings: bool,
 ) -> String {
     match opcode {
-        0x001e | 0x01a9 | 0x0150 | 0x011d => {
+        0x001e | 0x0030 | 0x01a9 | 0x0150 | 0x011d | 0x0120 => {
             let Some(index) = operand_u16(operands) else { return "missing variable index".into() };
             match symbols.locals.get(index as usize) {
                 Some(v) => format!("local [{}]: {}", index, v.name),
@@ -887,7 +887,7 @@ fn flow_statement(
     let op = ins.opcode;
     let p = &ins.operands;
     match op {
-        0x001e | 0x01a9 | 0x0150 | 0x011d => {
+        0x001e | 0x0030 | 0x01a9 | 0x0150 | 0x011d | 0x0120 => {
             stack.push(flow_local(sym, p));
             None
         }
@@ -936,13 +936,25 @@ fn flow_statement(
             stack.push(format!("({a} = {b})"));
             None
         }
+        0x007d => {
+            let b=flow_pop(stack);
+            let a=flow_pop(stack);
+            stack.push(format!("({a} + {b})"));
+            None
+        }
+        0x00b8 => {
+            let b=flow_pop(stack);
+            let a=flow_pop(stack);
+            stack.push(format!("({a} <> {b})"));
+            None
+        }
         0x0025 => {
             let b=flow_pop(stack);
             let a=flow_pop(stack);
             stack.push(format!("({a} OR {b})"));
             None
         }
-        0x003f | 0x008e | 0x0133 | 0x013b | 0x0139 | 0x0129 => None, // cast = no-op per PbdViewer
+        0x003f | 0x008e | 0x0133 | 0x013b | 0x0139 | 0x0129 | 0x012a => None, // cast = no-op per PbdViewer
         0x0080 | 0x0082 | 0x0088 => {
             let value=flow_pop(stack);
             let variable=flow_pop(stack);
@@ -1389,7 +1401,7 @@ fn scan_db_connections(parser: &PblParser) -> Result<(), Box<dyn std::error::Err
                 let target=match i.checked_sub(1).and_then(|j|lines.get(j)) {
                     Some(previous) if previous.opcode==0x002f =>
                         flow_global(&sym,&previous.operands),
-                    Some(previous) if matches!(previous.opcode,0x001e|0x01a9|0x0150) =>
+                    Some(previous) if matches!(previous.opcode,0x001e|0x0030|0x01a9|0x0150) =>
                         flow_local(&sym,&previous.operands),
                     _=>"<transaction expression not yet reconstructed>".into()
                 };
@@ -1425,6 +1437,98 @@ fn scan_db_connections(parser: &PblParser) -> Result<(), Box<dyn std::error::Err
     }
     println!("\nTo inspect a candidate without showing strings:");
     println!("  cargo run --release -p pb-devkit-cli --example probe_pcode -- f_connect.fun 0 120 --flow");
+    Ok(())
+}
+
+// Trace credential *provenance* at the CONNECT site without outputting
+// secrets, user names, connection strings, or literal values. Does not
+// perform authentication or modify PowerBuilder/ODBC configuration.
+fn inspect_connection_sites(
+    parser: &PblParser, name: &str, body_index: usize
+) -> Result<(), Box<dyn std::error::Error>> {
+    let entry=parser.entries().iter()
+        .find(|e|e.name.eq_ignore_ascii_case(name))
+        .ok_or_else(||format!("compiled entry not found: {name}"))?;
+    let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+    let symbols=find_pcode_symbols(&data,body_index)?;
+    let lines=flow_instructions(&symbols.code)?;
+    let mut connect_indices=Vec::new();
+    for (index,ins) in lines.iter().enumerate() {
+        if ins.opcode==0x0005 {connect_indices.push(index);}
+    }
+    println!("=== DB CONNECT PROVENANCE MAP (REDACTED) ===");
+    println!("Entry: {} | body: {} | CONNECT sites: {}",
+        entry.name,body_index,connect_indices.len());
+    println!("Only property names, function names and instruction offsets.");
+    println!("No source string values, passwords, or connection strings are decoded.\n");
+
+    for (site_no,&connect_index) in connect_indices.iter().enumerate() {
+        let connect=&lines[connect_index];
+        let transaction=match connect_index.checked_sub(1).and_then(|i|lines.get(i)) {
+            Some(prev) if matches!(prev.opcode,0x001e|0x0030|0x01a9|0x0150) =>
+                flow_local(&symbols,&prev.operands),
+            Some(prev) if prev.opcode==0x002f =>
+                flow_global(&symbols,&prev.operands),
+            _=>"<transaction expression unresolved>".into()
+        };
+        let start=if site_no==0 {0} else {connect_indices[site_no-1]+1};
+        let segment=&lines[start..connect_index];
+        println!("CONNECT #{} at 0x{:04X} USING {}",site_no+1,
+            connect.position,transaction);
+        println!("  Previous CONNECT: {}", if site_no==0 {"none"} else {"yes"});
+        let mut property_assigns=Vec::<(usize,String)>::new();
+        let mut calls=Vec::<(usize,String)>::new();
+        let mut literal_count=0usize;
+        for (i,ins) in segment.iter().enumerate() {
+            match ins.opcode {
+                0x0122 => {
+                    // A BEGIN ASSIGN instance-variable operation consumes a
+                    // field name and an object reference. Only report the name,
+                    // never the value subsequently assigned.
+                    if let Some(prev)=i.checked_sub(1).and_then(|j|segment.get(j)) {
+                        if prev.opcode==0x0020 {
+                            let field=flow_field_name(&symbols,&prev.operands);
+                            property_assigns.push((ins.position,field));
+                        }
+                    }
+                }
+                0x01bc => {
+                    let index=flow_operand_word(&ins.operands,0);
+                    let object_id=flow_operand_word(&ins.operands,2);
+                    if object_id & 0x8000 != 0 {
+                        let name=symbols.referenced_functions.get(index)
+                            .cloned().unwrap_or_else(||format!("function-ref#{index}"));
+                        calls.push((ins.position,name));
+                    }
+                }
+                0x003b => literal_count+=1,
+                _=>{}
+            }
+        }
+        println!("  Transaction/object field assignments in this segment:");
+        if property_assigns.is_empty() {
+            println!("    none identified using direct BeginAssignInstanceVariable");
+        }
+        for (offset,property) in &property_assigns {
+            let category=match property.to_ascii_lowercase().as_str() {
+                "dbpass"|"logpass" => " [PASSWORD FIELD: value omitted]",
+                "userid"|"logid" => " [IDENTITY FIELD: value omitted]",
+                "dbms"|"dbparm"|"database"|"servername" => " [CONNECTION FIELD: value omitted]",
+                _=>""
+            };
+            println!("    0x{offset:04X}  {property}{category}");
+        }
+        if !calls.is_empty() {
+            println!("  Referenced functions before this CONNECT:");
+            for (offset,name) in calls {
+                println!("    0x{offset:04X}  {name}()");
+            }
+        }
+        println!("  String literals encountered: {} (values hidden)",literal_count);
+    }
+    println!("\nInterpretation: reported functions are nearby dependencies,");
+    println!("not necessarily the direct origin of a specific credential value.");
+    println!("For exact data-flow, follow the property-assignment stack backwards.");
     Ok(())
 }
 
@@ -1500,6 +1604,14 @@ fn disassemble_one(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|arg|arg=="--connect-map").unwrap_or(false) {
+        if args.len()<2 || args.len()>3 {
+            return Err("usage: probe_pcode --connect-map <object.fun> [body_index]".into());
+        }
+        let index=args.get(2).map(|s|s.parse::<usize>()).transpose()?.unwrap_or(0);
+        let parser=PblParser::new(EXE)?;
+        return inspect_connection_sites(&parser,&args[1],index);
+    }
     if args.first().map(|arg|arg=="--db-scan").unwrap_or(false) {
         if args.len()!=1 {
             return Err("usage: probe_pcode --db-scan".into());
@@ -1615,6 +1727,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn reads_local_transaction_operand_for_connect() {
+        let symbols = FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol {name:"atrans".into(),global_index:None}],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),
+        };
+        assert_eq!(flow_local(&symbols,&[0,0]),"atrans");
+        let mut stack=Vec::new();
+        let push=FlowInsn {position:0,end:4,opcode:0x0030,operands:vec![0,0]};
+        assert_eq!(flow_statement(&push,&symbols,&mut stack,false),None);
+        let connect=FlowInsn {position:4,end:6,opcode:0x0005,operands:Vec::new()};
+        assert_eq!(flow_statement(&connect,&symbols,&mut stack,false),
+                   Some("CONNECT USING atrans".into()));
+    }
+
 
     #[test]
     fn connect_opcode_emits_transaction_operation_without_secrets() {
