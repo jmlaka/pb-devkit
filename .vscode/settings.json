@@ -1,0 +1,7 @@
+{
+  "rust-analyzer.linkedProjects": [
+    "./pb-devkit-2.x/pb-devkit-cli/Cargo.toml"
+  ],
+  "rust-analyzer.cargo.allTargets": true,
+  "rust-analyzer.check.command": "check"
+}
