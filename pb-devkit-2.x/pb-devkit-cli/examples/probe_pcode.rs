@@ -1627,6 +1627,155 @@ fn inspect_connection_sites(
     Ok(())
 }
 
+
+#[derive(Clone)]
+struct SystemCatalogObject {
+    name: String,
+    type_id: u16,
+    parent_type: u16,
+    all_member_count: usize,
+    instance_fields: Vec<String>,
+}
+
+fn system_object_fields(r: &mut Cursor<'_>) -> Result<Vec<String>,String> {
+    r.bytes(6)?;
+    let pool=pool_buffer(r)?;
+    let len=r.u16()? as usize;
+    if len%20!=0 {return Err("invalid system object variable records".into());}
+    let records=r.bytes(len)?;
+    let mut fields=Vec::new();
+    for rec in records.chunks_exact(20) {
+        if rec[0]&0x0f>1 {continue;}
+        let offset=u32::from_le_bytes([rec[8],rec[9],rec[10],rec[11]]);
+        let name=utf16_string(&pool,offset)
+            .ok_or_else(||"invalid system object property name".to_string())?;
+        fields.push(name);
+    }
+    Ok(fields)
+}
+
+fn parse_system_objects(data: &[u8]) -> Result<Vec<SystemCatalogObject>, String> {
+    let mut r=Cursor::new(data);
+    if r.u16()?!=333 {return Err("not a PB333 system group".into());}
+    r.bytes(22)?;
+    let descriptors=r.u16()? as usize;
+    r.bytes(descriptors.checked_mul(12).ok_or("too many descriptors")?)?;
+    r.struct_buffer()?;
+    r.records20()?;
+    let object_count=r.u16()? as usize;
+    let extended_count=r.u16()? as usize;
+    r.struct_buffer()?;
+    r.struct_buffer()?;
+    let type_names=named_types(&mut r)?;
+    r.records20()?;
+    let indices=r.bytes(object_count.checked_mul(16)
+        .ok_or("too many object indices")?)?.to_vec();
+    let extended=r.bytes(extended_count.checked_mul(32)
+        .ok_or("too many extended headers")?)?.to_vec();
+    let mut used_extended=0usize;
+    let mut objects=Vec::new();
+    for item in indices.chunks_exact(16) {
+        match (item[0]>>1)&7 {
+            0=>{
+                let start=used_extended.checked_mul(32).ok_or("bad extended offset")?;
+                let header=extended.get(start..start+32)
+                    .ok_or("missing system object header")?;
+                used_extended+=1;
+                let type_id=word(item,2)? as u16;
+                let parent_type=word(header,0)? as u16;
+                let count=r.u16()? as usize;
+                r.bytes(count.checked_mul(4).ok_or("too many functions")?)?;
+                for _ in 0..count {
+                    let len=r.u16()? as usize;
+                    let dbg=r.u16()? as usize;
+                    r.u16()?;
+                    r.bytes(len)?;
+                    r.bytes(dbg.checked_mul(4).ok_or("invalid debug length")?)?;
+                    r.records20()?;
+                    r.struct_buffer()?;
+                }
+                r.bytes(word(header,24)?.checked_mul(6).ok_or("invalid events")?)?;
+                r.bytes(word(header,22)?.checked_mul(4).ok_or("invalid references")?)?;
+                r.records20()?;
+                let instance_fields=system_object_fields(&mut r)?;
+                let all_member_count=word(header,28)?;
+                r.bytes(all_member_count.checked_mul(8).ok_or("invalid all-variable entries")?)?;
+                r.bytes(word(header,26)?.checked_mul(16).ok_or("invalid function references")?)?;
+                r.bytes(word(header,4)?.checked_mul(48).ok_or("invalid definitions")?)?;
+                let name=type_names.get((type_id&0x3fff) as usize)
+                    .cloned().unwrap_or_else(||format!("type 0x{type_id:04X}"));
+                objects.push(SystemCatalogObject {
+                    name,type_id,parent_type,all_member_count,instance_fields
+                });
+            }
+            1=>{r.bytes(word(item,4)?.checked_mul(8)
+                .ok_or("invalid system nonobject entry")?)?;}
+            _=>{}
+        }
+    }
+    if r.pos!=data.len() {
+        return Err(format!("system group end mismatch 0x{:X} vs 0x{:X}",r.pos,data.len()));
+    }
+    Ok(objects)
+}
+
+fn system_property_name(
+    objects: &[SystemCatalogObject], type_id:u16, member:usize,
+    depth:usize,
+) -> Option<String> {
+    if depth>32 {return None;}
+    let obj=objects.iter().find(|x|x.type_id==type_id)?;
+    if member>=obj.all_member_count ||
+        obj.instance_fields.len()>obj.all_member_count {return None;}
+    let start=obj.all_member_count-obj.instance_fields.len();
+    if member>=start {
+        return obj.instance_fields.get(member-start).cloned();
+    }
+    if obj.parent_type!=type_id {
+        system_property_name(objects,obj.parent_type,member,depth+1)
+    } else {None}
+}
+
+fn transaction_catalog_scan(parser:&PblParser) -> Result<(),Box<dyn std::error::Error>> {
+    println!("=== TRANSACTION TYPE MEMBER CATALOG ===");
+    println!("Only system property names and indices are reported; no values.");
+    let groups:Vec<_>=parser.entries().iter().filter(|entry|
+        entry.name.to_ascii_lowercase().ends_with(".grp")).collect();
+    println!("Bundled .grp entries: {}",groups.len());
+    if groups.is_empty() {
+        println!("No system catalog bundled in this EXE.");
+        println!("PB333 instance property indexes #2/#14/#15 cannot yet be named reliably.");
+        return Ok(());
+    }
+    let mut objects=Vec::new();
+    for group in groups {
+        let data=match parser.parse_chunk_chain(group.data_offset,group.size) {
+            Ok(data)=>data,
+            Err(err)=>{println!("Could not read group {}: {err}",group.name);continue;}
+        };
+        match parse_system_objects(&data) {
+            Ok(found)=>{
+                println!("Parsed system group {} ({} objects)",group.name,found.len());
+                objects.extend(found);
+            }
+            Err(err)=>println!("Could not parse group {}: {err}",group.name)
+        }
+    }
+    let transaction=objects.iter().find(|obj|obj.name.eq_ignore_ascii_case("transaction"));
+    if let Some(trans)=transaction {
+        println!("Transaction: type=0x{:04X}, inherited type=0x{:04X}, all members={}",
+            trans.type_id,trans.parent_type,trans.all_member_count);
+        for index in [2usize,14,15] {
+            let result=system_property_name(&objects,trans.type_id,index,0)
+                .unwrap_or_else(||"<unresolved, inherited catalog may be absent>".into());
+            println!("  member #{index}: {result}");
+        }
+    } else {
+        println!("Transaction class not located in available system catalog objects.");
+    }
+    Ok(())
+}
+
 fn disassemble_one(
     parser: &PblParser,
     name: &str,
@@ -1699,6 +1848,11 @@ fn disassemble_one(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|arg|arg=="--transaction-catalog").unwrap_or(false) {
+        if args.len()!=1 {return Err("usage: probe_pcode --transaction-catalog".into());}
+        let parser=PblParser::new(EXE)?;
+        return transaction_catalog_scan(&parser);
+    }
     if args.first().map(|arg|arg=="--connect-map").unwrap_or(false) {
         if args.len()<2 || args.len()>3 {
             return Err("usage: probe_pcode --connect-map <object.fun> [body_index]".into());
@@ -1822,6 +1976,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+
+    #[test]
+    fn catalog_members_resolve_own_and_inherited_slots() {
+        let base=SystemCatalogObject {
+            name:"base".into(),type_id:0x4001,parent_type:0xFFFF,
+            all_member_count:2,instance_fields:vec!["parent_a".into(),"parent_b".into()]
+        };
+        let trans=SystemCatalogObject {
+            name:"transaction".into(),type_id:0x4013,parent_type:0x4001,
+            all_member_count:4,instance_fields:vec!["dbms".into(),"logpass".into()]
+        };
+        let objects=vec![base,trans];
+        assert_eq!(system_property_name(&objects,0x4013,0,0),Some("parent_a".into()));
+        assert_eq!(system_property_name(&objects,0x4013,3,0),Some("logpass".into()));
+        assert_eq!(system_property_name(&objects,0x4013,9,0),None);
+    }
     #[test]
     fn type_metadata_reports_system_index_without_guessing_property() {
         assert!(describe_type_id(0x4013,&[]).contains("system catalog required"));
