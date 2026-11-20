@@ -408,6 +408,7 @@ fn simple_constant_return(code: &[u8]) -> Option<i32> {
 struct VariableSymbol {
     name: String,
     global_index: Option<u16>,
+    type_id: u16,
 }
 
 struct FunctionSymbols {
@@ -417,6 +418,7 @@ struct FunctionSymbols {
     globals: Vec<VariableSymbol>,
     referenced_functions: Vec<String>,
     sql_pool: Vec<u8>,
+    type_names: Vec<String>,
 }
 
 fn pool_buffer(r: &mut Cursor<'_>) -> Result<Vec<u8>, String> {
@@ -459,10 +461,45 @@ fn named_variables(r: &mut Cursor<'_>) -> Result<Vec<VariableSymbol>, String> {
         let global_index = if rec[17] & 2 != 0 {
             Some(u16::from_le_bytes([rec[12], rec[13]]))
         } else { None };
-        VariableSymbol { name, global_index }
+        let type_id = u16::from_le_bytes([rec[18], rec[19]]);
+        VariableSymbol { name, global_index, type_id }
     }).collect())
 }
 
+
+// Type records use the same 6-byte prefix, name pool and 20-byte records
+// as PbEntry.ReadTypes(). Type IDs 0x4xxx refer to external/system types;
+// 0x8xxx refer to entries in this local table.
+fn named_types(r: &mut Cursor<'_>) -> Result<Vec<String>, String> {
+    r.bytes(6)?;
+    let pool=pool_buffer(r)?;
+    let len=r.u16()? as usize;
+    if len % 20 != 0 {
+        return Err(format!("type table size {len} not divisible by 20"));
+    }
+    let records=r.bytes(len)?;
+    Ok(records.chunks_exact(20).enumerate().map(|(i,rec)| {
+        let off=u32::from_le_bytes([rec[8],rec[9],rec[10],rec[11]]);
+        utf16_string(&pool,off)
+            .filter(|name|!name.is_empty() && !name.chars().any(char::is_control))
+            .unwrap_or_else(||format!("<type#{i}>"))
+    }).collect())
+}
+
+fn describe_type_id(type_id: u16, local_types: &[String]) -> String {
+    match type_id & 0xF000 {
+        0x4000 => format!("system type 0x{type_id:04X} (system catalog required for name)"),
+        0x8000 => {
+            let index=(type_id & 0x3FFF) as usize;
+            match local_types.get(index) {
+                Some(name)=>format!("local type 0x{type_id:04X} ({name})"),
+                None=>format!("local type 0x{type_id:04X} (name unresolved)")
+            }
+        }
+        0xC000 => format!("unknown/external type 0x{type_id:04X}"),
+        _ =>format!("primitive type 0x{type_id:04X}")
+    }
+}
 
 fn named_references(r: &mut Cursor<'_>) -> Result<Vec<String>, String> {
     // PbdViewer ReadReferencedFunctions(): 6 bytes, name pool,
@@ -665,7 +702,7 @@ fn find_pcode_symbols(data: &[u8], selected: usize) -> Result<FunctionSymbols, S
     let extended_count = r.u16()? as usize;
     r.struct_buffer()?;
     r.struct_buffer()?;
-    r.records20()?;
+    let type_names=named_types(&mut r)?;
     r.records20()?;
 
     let indices = r.bytes(object_count * 16)?;
@@ -696,7 +733,8 @@ fn find_pcode_symbols(data: &[u8], selected: usize) -> Result<FunctionSymbols, S
                         selected_data = Some(FunctionSymbols {
                             code, stack_buffer, locals,
                             globals: globals.clone(), referenced_functions: Vec::new(),
-                            sql_pool: sql_pool.clone()
+                            sql_pool: sql_pool.clone(),
+                            type_names: type_names.clone(),
                         });
                     } else {
                         r.records20()?;
@@ -1491,7 +1529,15 @@ fn inspect_connection_sites(
     println!("Entry: {} | body: {} | CONNECT sites: {}",
         entry.name,body_index,connect_indices.len());
     println!("Only property names, function names and instruction offsets.");
-    println!("No source string values, passwords, or connection strings are decoded.\n");
+    println!("No source string values, passwords, or connection strings are decoded.\n");    for (i,var) in symbols.locals.iter().enumerate() {
+        if var.name.eq_ignore_ascii_case("at_sql") ||
+            var.name.to_ascii_lowercase().contains("sql")
+        {
+            println!("Local variable [{}] {}: {}",
+                i,var.name,describe_type_id(var.type_id,&symbols.type_names));
+        }
+    }
+
 
     for (site_no,&connect_index) in connect_indices.iter().enumerate() {
         let connect=&lines[connect_index];
@@ -1777,6 +1823,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod semantic_probe_tests {
     use super::*;
     #[test]
+    fn type_metadata_reports_system_index_without_guessing_property() {
+        assert!(describe_type_id(0x4013,&[]).contains("system catalog required"));
+        assert_eq!(
+            describe_type_id(0x8000,&["transaction".to_string()]),
+            "local type 0x8000 (transaction)"
+        );
+    }
+
+    #[test]
     fn index_only_transaction_member_does_not_guess_name() {
         let mut buffer = vec![0u8; 32];
         buffer[8..12].copy_from_slice(&0x0000FFFFu32.to_le_bytes());
@@ -1785,6 +1840,7 @@ mod semantic_probe_tests {
             code:Vec::new(),stack_buffer:buffer,
             locals:Vec::new(),globals:Vec::new(),
             referenced_functions:Vec::new(),sql_pool:Vec::new(),
+            type_names:Vec::new(),
         };
         let metadata=field_descriptor_metadata(&symbols,&8u16.to_le_bytes());
         assert!(metadata.contains("type-indexed member=#123"));
@@ -1796,7 +1852,7 @@ mod semantic_probe_tests {
     fn reads_local_transaction_operand_for_connect() {
         let symbols = FunctionSymbols {
             code:Vec::new(),stack_buffer:Vec::new(),
-            locals:vec![VariableSymbol {name:"atrans".into(),global_index:None}],
+            locals:vec![VariableSymbol {name:"atrans".into(),global_index:None,type_id:0x4000}],
             globals:Vec::new(),referenced_functions:Vec::new(),
             sql_pool:Vec::new(),
         };
@@ -1816,6 +1872,7 @@ mod semantic_probe_tests {
             code: Vec::new(), stack_buffer: Vec::new(),
             locals: Vec::new(), globals: Vec::new(),
             referenced_functions: Vec::new(), sql_pool: Vec::new(),
+            type_names:Vec::new(),
         };
         let instruction = FlowInsn {
             position: 0, end: 2, opcode: 0x0005,
@@ -1886,6 +1943,7 @@ mod sql_cursor_interpolation_tests {
             code: Vec::new(), stack_buffer: Vec::new(),
             locals: Vec::new(), globals: Vec::new(),
             referenced_functions: Vec::new(), sql_pool: pool,
+            type_names:Vec::new(),
         };
         let sql = sql_with_bound_params(
             &symbols, &0x8000_0010u32.to_le_bytes(),
