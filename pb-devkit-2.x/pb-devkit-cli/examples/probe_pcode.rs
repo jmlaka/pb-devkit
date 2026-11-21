@@ -806,6 +806,7 @@ fn annotated_opcode(
                 None => format!("string offset 0x{:X} could not be decoded", offset),
             }
         }
+        0x01a4 => "builtin Upper(value)".into(),
         0x01bc => {
             let idx = flow_operand_word(operands,0);
             let object_id = flow_operand_word(operands,2);
@@ -967,6 +968,13 @@ fn flow_statement(
                 None => "<string-offset-unresolved>".into(),
             };
             stack.push(value);
+            None
+        }
+        // PCodeParser110 index 0x01A4 -> 105 case 422 -> 100 case
+        // 420 -> PCodeParser90 upper(). A unary builtin string operation.
+        0x01a4 => {
+            let value=flow_pop(stack);
+            stack.push(format!("Upper({value})"));
             None
         }
         0x0195 => {
@@ -1712,10 +1720,51 @@ fn preconnect_branch_gates(lines:&[FlowInsn])
 // to guess a value that arrives from a predecessor block. Numeric and string
 // literals are both suppressed. No call is executed; only opcode metadata is
 // read. The full condition is shown only when the stack is fully resolved.
+// PB333 primary connection selector: a local receives Upper(parameter)
+// and is compared with two string literals using equality + false jump.
+// The instruction template is checked explicitly; nothing is inferred from
+// merely nearby instructions. Constants and their offsets are not displayed.
+fn pb333_connection_mode_predicate(
+    lines:&[FlowInsn], sym:&FunctionSymbols, branch_position:usize
+) -> Option<String> {
+    let branch_index=lines.iter().position(|ins|ins.position==branch_position)?;
+    if branch_index<3 {return None;}
+    let compare=&lines[branch_index-1];
+    let value=&lines[branch_index-2];
+    let literal=&lines[branch_index-3];
+    let branch=&lines[branch_index];
+    if branch.opcode!=0x0003 ||
+        compare.opcode!=0x00ad ||
+        value.opcode!=0x001e ||
+        literal.opcode!=0x003b {return None;}
+    let selector_idx=flow_operand_word(&value.operands,0);
+    let selector=sym.locals.get(selector_idx)?;
+    // Verify a direct assignment of Upper(local) to the selector variable.
+    // Prefer the closest assignment before this comparison, avoiding a
+    // mistaken mapping to an old overwritten value.
+    let mut definitions=lines.windows(4)
+        .filter(|w|w[0].position<branch_position &&
+            w[0].opcode==0x011d &&
+            flow_operand_word(&w[0].operands,0)==selector_idx &&
+            w[1].opcode==0x001e &&
+            w[2].opcode==0x01a4 &&
+            matches!(w[3].opcode,0x0080|0x0082|0x0088));
+    let def=definitions.next_back()?;
+    let source_idx=flow_operand_word(&def[1].operands,0);
+    let source=sym.locals.get(source_idx)?;
+    if source.type_id!=0x0006 || selector.type_id!=0x0006 {return None;}
+    if source.name.is_empty() || source.name.chars().any(|c|
+        !c.is_ascii_alphanumeric() && c!='_') {return None;}
+    Some(format!("(Upper({}) = <string-hidden>)",source.name))
+}
+
 fn redacted_entry_gate_predicate(
     lines:&[FlowInsn], sym:&FunctionSymbols, branch_position:usize
 ) -> String {
     use std::collections::BTreeSet;
+    if let Some(predicate)=pb333_connection_mode_predicate(lines,sym,branch_position) {
+        return predicate;
+    }
     let mut boundaries=BTreeSet::new();
     boundaries.insert(0usize);
     for ins in lines {
@@ -1817,6 +1866,7 @@ fn redacted_gate_instruction(sym:&FunctionSymbols, ins:&FlowInsn) -> String {
             }
         },
         0x0020|0x01d2=>field_descriptor_metadata(sym,&ins.operands),
+        0x01a4=>"builtin Upper(value)".into(),
         _=>format!("{}",opcode_action(op)),
     }
 }
@@ -2647,6 +2697,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn pb333_connection_selector_is_upper_of_as_typ_without_exposing_modes() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![
+                VariableSymbol {name:"at_sql".into(),global_index:None,type_id:0x8000},
+                VariableSymbol {name:"as_typ".into(),global_index:None,type_id:0x0006},
+                VariableSymbol {name:"<variable#9>".into(),global_index:None,type_id:0x0006},
+            ],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let ins=vec![
+            FlowInsn {position:0x007c,end:0x0080,opcode:0x011d,
+                operands:vec![2,0]},
+            FlowInsn {position:0x0080,end:0x0084,opcode:0x001e,
+                operands:vec![1,0]},
+            FlowInsn {position:0x0084,end:0x0088,opcode:0x01a4,
+                operands:vec![0,0]},
+            FlowInsn {position:0x0088,end:0x008c,opcode:0x0088,
+                operands:vec![0,0]},
+            FlowInsn {position:0x008c,end:0x0092,opcode:0x003b,
+                operands:vec![0,0,0,0]},
+            FlowInsn {position:0x0092,end:0x0096,opcode:0x001e,
+                operands:vec![2,0]},
+            FlowInsn {position:0x0096,end:0x009c,opcode:0x00ad,
+                operands:vec![0,0,0,0]},
+            FlowInsn {position:0x009c,end:0x00a0,opcode:0x0003,
+                operands:vec![0xc8,0x02]},
+            FlowInsn {position:0x02c8,end:0x02ce,opcode:0x003b,
+                operands:vec![0,0,0,0]},
+            FlowInsn {position:0x02ce,end:0x02d2,opcode:0x001e,
+                operands:vec![2,0]},
+            FlowInsn {position:0x02d2,end:0x02d8,opcode:0x00ad,
+                operands:vec![0,0,0,0]},
+            FlowInsn {position:0x02d8,end:0x02dc,opcode:0x0003,
+                operands:vec![0xf0,0x04]},
+        ];
+        for offset in [0x009cusize,0x02d8usize] {
+            assert_eq!(
+                pb333_connection_mode_predicate(&ins,&sym,offset),
+                Some("(Upper(as_typ) = <string-hidden>)".into()));
+            assert_eq!(
+                redacted_entry_gate_predicate(&ins,&sym,offset),
+                "(Upper(as_typ) = <string-hidden>)");
+        }
+        let mut stack=vec!["as_typ".to_string()];
+        let builtin=FlowInsn {position:0,end:4,opcode:0x01a4,
+            operands:vec![0,0]};
+        assert_eq!(flow_statement(&builtin,&sym,&mut stack,false),None);
+        assert_eq!(stack,vec!["Upper(as_typ)".to_string()]);
+    }
+
+    #[test]
+    fn connection_selector_rejects_non_string_or_non_upper_source() {
+        let mut sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![
+                VariableSymbol {name:"as_typ".into(),global_index:None,type_id:0x0006},
+                VariableSymbol {name:"mode".into(),global_index:None,type_id:0x0006},
+            ],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mut ins=vec![
+            FlowInsn {position:0,end:4,opcode:0x011d,operands:vec![1,0]},
+            FlowInsn {position:4,end:8,opcode:0x001e,operands:vec![0,0]},
+            FlowInsn {position:8,end:12,opcode:0x01a4,operands:vec![0,0]},
+            FlowInsn {position:12,end:16,opcode:0x0088,operands:vec![0,0]},
+            FlowInsn {position:16,end:22,opcode:0x003b,operands:vec![0,0,0,0]},
+            FlowInsn {position:22,end:26,opcode:0x001e,operands:vec![1,0]},
+            FlowInsn {position:26,end:32,opcode:0x00ad,operands:vec![0,0,0,0]},
+            FlowInsn {position:32,end:36,opcode:0x0003,operands:vec![40,0]},
+        ];
+        assert!(pb333_connection_mode_predicate(&ins,&sym,32).is_some());
+        sym.locals[0].type_id=0x0001;
+        assert!(pb333_connection_mode_predicate(&ins,&sym,32).is_none());
+        sym.locals[0].type_id=0x0006;
+        ins[2].opcode=0x01a3;
+        assert!(pb333_connection_mode_predicate(&ins,&sym,32).is_none());
+    }
+
     #[test]
     fn gate_diagnostics_suppress_literal_bytes_and_numeric_values() {
         let sym=FunctionSymbols {
