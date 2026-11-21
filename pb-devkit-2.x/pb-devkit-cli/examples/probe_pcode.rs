@@ -1590,6 +1590,42 @@ fn call_argument_stack_sources(
 // Examine the variables feeding f_connect at a specific direct callsite.
 // Only metadata and redacted formula fragments are emitted. A linear
 // assignment list is not equivalent to branch-sensitive dataflow.
+// Target-specific compiled predicates at known P-code sites. Each
+// instruction and function-name resolution is checked before reporting.
+// The compared literals remain hidden regardless of sensitive-output mode.
+fn connection_name_verified_predicate(
+    lines:&[FlowInsn],sym:&FunctionSymbols,branch_position:usize,
+)->Option<String> {
+    let branch_index=lines.iter().position(|x|x.position==branch_position)?;
+    let branch=lines.get(branch_index)?;
+    if branch.opcode!=0x0003{return None;}
+    match branch_position {
+        0x0a94=>{
+            if branch_index<3{return None;}
+            let w=&lines[branch_index-3..=branch_index];
+            if !(w[0].opcode==0x002f && w[1].opcode==0x003b &&
+                w[2].opcode==0x00ad && w[3].opcode==0x0003)
+            {return None;}
+            let variable=flow_global(sym,&w[0].operands);
+            if gate_symbol_name(&variable)=="<unnamed>" ||
+                variable.starts_with("global[")
+            {return None;}
+            Some(format!("({variable} = <string-hidden>)"))
+        },
+        0x0ada=>{
+            if branch_index<6{return None;}
+            let w=&lines[branch_index-6..=branch_index];
+            let expected=[0x0021,0x0020,0x0027,0x0034,0x003f,0x00a8,0x0003];
+            if !w.iter().map(|x|x.opcode).eq(expected){return None;}
+            let member=flow_field_name(sym,&w[1].operands);
+            if gate_symbol_name(&member)=="<unnamed>" ||
+                member.starts_with("field[") {return None;}
+            Some(format!("(this.{member} = <integer-hidden>)"))
+        },
+        _=>None,
+    }
+}
+
 fn print_connection_input_origins(
     lines:&[FlowInsn],sym:&FunctionSymbols,
     records:&[[u8;20]],value_pool:&[u8],call_offset:usize,
@@ -1692,7 +1728,8 @@ fn print_connection_input_origins(
         println!("  0x{:04X}: {} -> 0x{:04X} | fallthrough 0x{:04X}",
             ins.position,kind,dest,ins.end);
         if matches!(ins.opcode,0x0002|0x0003) {
-            let predicate=redacted_entry_gate_predicate(lines,sym,ins.position);
+            let predicate=connection_name_verified_predicate(lines,sym,ins.position)
+                .unwrap_or_else(||redacted_entry_gate_predicate(lines,sym,ins.position));
             println!("    Condition: {predicate}");
             // The generic single-block interpreter sometimes stops at an
             // unsupported PB333 opcode. Surface the exact bounded block as
@@ -3967,7 +4004,7 @@ fn report_system_catalog(objects:&[SystemCatalogObject], source:&str) {
         Some(obj)=>{
             println!("\nSystem function owner: {} (0x{:04X}, {} definitions)",
                 obj.name,obj.type_id,obj.function_definitions.len());
-            for idx in [81usize,139usize,339usize] {
+            for idx in [81usize,139usize,270usize,339usize] {
                 match obj.function_definitions.get(idx) {
                     Some(function)=>println!("  P-code system function 0x40D0:{idx} = {function}"),
                     None=>println!("  P-code system function index {idx} not in this definition table"),
@@ -5394,6 +5431,31 @@ mod semantic_probe_tests {
         let args=call_argument_stack_sources(&seq,6,&sym,6,4).unwrap();
         assert_eq!(args[0],"<empty string literal>");
         assert_eq!(args[3],"g_connect_name");
+    }
+
+    #[test]
+    fn specialized_connection_name_predicate_resolves_global_compare() {
+        let sym=FunctionSymbols{
+            code:Vec::new(),stack_buffer:Vec::new(),locals:vec![
+                VariableSymbol{name:"gs_nazov_exe".into(),type_id:6,global_index:Some(57)}
+            ],globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mk=|pos,op,bytes:Vec<u8>|FlowInsn{
+            position:pos,end:pos+2+bytes.len(),opcode:op,operands:bytes
+        };
+        let mut instructions=vec![
+            mk(0x0a84,0x002f,vec![57,0]),
+            mk(0x0a88,0x003b,vec![0;4]),
+            mk(0x0a8e,0x00ad,vec![]),
+            mk(0x0a94,0x0003,vec![0xb2,0x0a]),
+        ];
+        assert_eq!(
+            connection_name_verified_predicate(&instructions,&sym,0x0a94),
+            Some("(gs_nazov_exe = <string-hidden>)".to_owned())
+        );
+        instructions[2].opcode=0x007d;
+        assert!(connection_name_verified_predicate(&instructions,&sym,0x0a94).is_none());
     }
 
     #[test]
