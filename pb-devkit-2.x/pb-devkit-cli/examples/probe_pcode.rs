@@ -2234,10 +2234,14 @@ fn print_transaction_assignment_paths(
 }
 
 fn print_connect_return_map(lines:&[FlowInsn], sym:&FunctionSymbols,
-    catalog:Option<&[SystemCatalogObject]>) {
+    catalog:Option<&[SystemCatalogObject]>, show_sensitive:bool) {
     println!("\n=== CONNECT RETURN CONTRACT (REDACTED STATIC TRACE) ===");
     println!("Reachable RETURN sites, nearby opcodes and conservative payload hints.");
-    println!("No raw operands, passwords, DBParm text, string literals or arbitrary numbers.");
+    if show_sensitive {
+        println!("SENSITIVE MODE: available compiled literals follow; runtime values still unknown.");
+    } else {
+        println!("No raw operands, passwords, DBParm text, string literals or arbitrary numbers.");
+    }
     let reachable=reachable_return_indices(lines);
     println!("Reachable RETURN instructions: {}",reachable.len());
     for index in reachable {
@@ -2255,7 +2259,7 @@ fn print_connect_return_map(lines:&[FlowInsn], sym:&FunctionSymbols,
         for item in block.iter().skip(recent) {
             println!("    0x{:04X} 0x{:04X} {:<27} {}",
                 item.position,item.opcode,opcode_action(item.opcode),
-                redacted_gate_instruction(sym,item));
+                redacted_gate_instruction(sym,item,show_sensitive));
         }
     }
     println!("\nNote: RETURN payload hints inspect preceding opcodes only; they do not");
@@ -2300,10 +2304,14 @@ fn sql_literal_intent(literal:&str) -> Option<&'static str> {
 // IMMEDIATE. The reified SQL is never printed. Even a recognized prefix is
 // only evidence from a literal, not a proven classification of the final SQL.
 fn print_post_connect_sql_trace(
-    lines:&[FlowInsn],sym:&FunctionSymbols,
+    lines:&[FlowInsn],sym:&FunctionSymbols,show_sensitive:bool,
 ) {
     println!("=== POST-CONNECT DYNAMIC SQL TRACE (REDACTED) ===");
-    println!("Static bytecode only: no SQL values, raw operands, secret literals or query execution.");
+    if show_sensitive {
+        println!("SENSITIVE MODE: compiled literals shown where decoded. No SQL execution.");
+    } else {
+        println!("Static bytecode only: no SQL values, raw operands, secret literals or query execution.");
+    }
     let sql_sites:Vec<usize>=lines.iter().enumerate()
         .filter_map(|(idx,ins)|(ins.opcode==0x01c3).then_some(idx))
         .collect();
@@ -2423,11 +2431,19 @@ fn print_post_connect_sql_trace(
         for ins in block.iter().rev().take(65).rev() {
             println!("    0x{:04X} 0x{:04X} {:<27} {}",
                 ins.position,ins.opcode,opcode_action(ins.opcode),
-                redacted_gate_instruction(sym,ins));
+                redacted_gate_instruction(sym,ins,show_sensitive));
         }
         if block.len()>65 {
             println!("    {} earlier instruction(s) in this block omitted",
                 block.len()-65);
+        }
+        if show_sensitive {
+            println!("  Decodable static literals in this SQL basic block:");
+            for ins in &block {
+                if let Some(literal)=sensitive_literal_at(sym,ins) {
+                    println!("    0x{:04X}  {literal}",ins.position);
+                }
+            }
         }
     }
     println!("\nWarning: a string-literal SQL prefix does not prove the final dynamic statement.");
@@ -2436,7 +2452,7 @@ fn print_post_connect_sql_trace(
 
 fn inspect_connection_sites(
     parser: &PblParser, name: &str, body_index: usize,
-    system_catalog: Option<&[SystemCatalogObject]>,
+    system_catalog: Option<&[SystemCatalogObject]>, show_sensitive:bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entry=parser.entries().iter()
         .find(|e|e.name.eq_ignore_ascii_case(name))
@@ -2452,7 +2468,12 @@ fn inspect_connection_sites(
     println!("Entry: {} | body: {} | CONNECT sites: {}",
         entry.name,body_index,connect_indices.len());
     println!("Only property names, function names and instruction offsets.");
-    println!("No source string values, passwords, or connection strings are displayed.\n");
+    if show_sensitive {
+        println!("SENSITIVE MODE: static literals may contain DSNs, passwords or SQL.");
+        println!("Computed DBParm values are NOT reconstructed.\n");
+    } else {
+        println!("No source string values, passwords, or connection strings are displayed.\n");
+    }
     if system_catalog.is_some() {
         println!("External PB333 system catalog: loaded and used for transaction fields.");
     }
@@ -2560,14 +2581,22 @@ fn inspect_connection_sites(
                 println!("    0x{offset:04X}  {name}()");
             }
         }
-        println!("  String literals encountered: {} (values hidden)",literal_count);
+        println!("  String literals encountered: {}",literal_count);
+        if show_sensitive {
+            println!("  Decodable compiled literals in this segment:");
+            for ins in segment {
+                if let Some(value)=sensitive_literal_at(&symbols,ins) {
+                    println!("    0x{:04X}  {value}",ins.position);
+                }
+            }
+        }
     }
     println!("\nInterpretation: reported functions are nearby dependencies,");
     println!("not necessarily the direct origin of a specific credential value.");
     println!("For exact data-flow, follow the property-assignment stack backwards.");
     print_connection_control_flow(&lines,&symbols,system_catalog,&connect_indices);
-    print_preconnect_routing(&lines,&symbols);
-    print_connect_return_map(&lines,&symbols,system_catalog);
+    print_preconnect_routing(&lines,&symbols,show_sensitive);
+    print_connect_return_map(&lines,&symbols,system_catalog,show_sensitive);
     print_transaction_assignment_paths(&lines,&symbols,system_catalog);
     Ok(())
 }
