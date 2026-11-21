@@ -3988,6 +3988,109 @@ fn print_heslo_initializers(
 // Trace the compiled origin of f_connect's ls_pom template without
 // decoding its contents. This is a structural read of PB333 declarations
 // and P-code; no DB connection, credential calculation, or output values.
+// Extract a specific local assignment at a known compiler instruction
+// boundary. Refuse to cross control-flow operations or another assignment.
+// This proves only the local expression, not its reachability on a route.
+fn local_assignment_at<'a>(
+    lines:&'a [FlowInsn],at:usize,idx:usize,
+)->Result<&'a [FlowInsn],String> {
+    let begin=lines.iter().position(|ins|ins.position==at)
+        .ok_or_else(||format!("no instruction at 0x{at:04X}"))?;
+    let first=&lines[begin];
+    if !matches!(first.opcode,0x011d|0x0120) ||
+        flow_operand_word(&first.operands,0)!=idx {
+        return Err(format!("0x{at:04X} is not a BeginAssign to requested local"));
+    }
+    let limit=lines.len().min(begin.saturating_add(256));
+    for i in (begin+1)..limit {
+        match lines[i].opcode {
+            0x0000..=0x0004|0x0005..=0x0008|0x011d|0x0120=>{
+                return Err(format!("assignment crosses control flow or nested BeginAssign at 0x{:04X}",lines[i].position));
+            },
+            0x0080|0x0082|0x0088=>return Ok(&lines[begin..=i]),
+            _=>{},
+        }
+    }
+    Err(format!("no safe assignment end after 0x{at:04X}"))
+}
+
+fn print_connect_template_build(
+    lines:&[FlowInsn],sym:&FunctionSymbols,
+    catalog:&[SystemCatalogObject],
+) {
+    println!("=== PRECONNECT LS_POM CONSTRUCTION (REDACTED) ===");
+    println!("Literal contents, lengths, numeric values and hashes suppressed.");
+    println!("These are lexical expressions; branch reachability is not newly proved.");
+    let matches=sym.locals.iter().enumerate()
+        .filter(|(_,v)|v.name.eq_ignore_ascii_case("ls_pom"))
+        .map(|(i,_)|i).collect::<Vec<_>>();
+    if matches.len()!=1 {
+        println!("ls_pom local not unique: analysis refused.");
+        return;
+    }
+    let idx=matches[0];
+    let mut verified=Vec::<(&[FlowInsn],&str)>::new();
+    for (offset,label) in [(0x00b2usize,"Mode A"),(0x02dcusize,"Mode B")] {
+        println!("  {label}, BeginAssign 0x{offset:04X}:");
+        match local_assignment_at(lines,offset,idx) {
+            Ok(segment)=>{
+                println!("    Assignment ends at 0x{:04X}",segment.last().unwrap().position);
+                println!("    Instructions: {}, string constants: {}, integer constants: {}",
+                    segment.len(),segment.iter().filter(|v|v.opcode==0x003b).count(),
+                    segment.iter().filter(|v|v.opcode==0x0034).count());
+                let has_self_read=segment.iter().skip(1).any(|ins|
+                    matches!(ins.opcode,0x001e|0x0030|0x01a9|0x0150) &&
+                    flow_operand_word(&ins.operands,0)==idx
+                ) || segment.iter().any(|ins|ins.opcode==0x0119);
+                println!("    Depends on previous ls_pom value: {}",
+                    if has_self_read {"yes or possible"} else {"no direct read or ResetAssign"});
+                let refs=segment.iter().collect::<Vec<_>>();
+                match sql_assignment_expression(&refs,sym,Some(catalog),false) {
+                    Ok(formula)=>{
+                        if formula.len()<=2400 {
+                            println!("    Redacted formula: {formula}");
+                        } else {println!("    Formula over output limit; hidden.");}
+                    },
+                    Err(e)=>println!("    Redacted formula: unresolved ({e})"),
+                }
+                verified.push((segment,label));
+            },
+            Err(e)=>println!("    Assignment extraction failed: {e}"),
+        }
+    }
+    if verified.len()==2 {
+        let left=verified[0].0;
+        let right=verified[1].0;
+        let structure=left.len()==right.len() &&
+            left.iter().zip(right).all(|(a,b)|
+                dbparm_instruction_shape_matches(sym,a,b));
+        println!("  Mode A/B nonconstant instruction structure: {}",
+            if structure {"matches"} else {"different"});
+        if structure {
+            let mut string_eq=Vec::new();
+            let mut integer_eq=Vec::new();
+            for (a,b) in left.iter().zip(right) {
+                if a.opcode==0x003b {
+                    string_eq.push(dbparm_constant_equality(sym,a,b).label());
+                } else if a.opcode==0x0034 {
+                    integer_eq.push(dbparm_constant_equality(sym,a,b).label());
+                }
+            }
+            let format_result=|states:&[&str]|->String {
+                if states.is_empty() {return "none".to_string();}
+                states.iter().enumerate()
+                    .map(|(i,v)|format!("{}:{v}",i+1))
+                    .collect::<Vec<_>>().join(", ")
+            };
+            println!("  String-slot equality (A vs B): {}",format_result(&string_eq));
+            println!("  Integer-slot equality (A vs B): {}",format_result(&integer_eq));
+        } else {
+            println!("  Constant slots not compared across different structures.");
+        }
+    }
+    println!("No connection was attempted and no DBParm string was evaluated.");
+}
+
 fn print_connect_template_origin(
     sym:&FunctionSymbols,
     lines:&[FlowInsn],
@@ -4238,6 +4341,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.len()!=1 {return Err("usage: probe_pcode --transaction-catalog".into());}
         let parser=PblParser::new(EXE)?;
         return transaction_catalog_scan(&parser);
+    }
+    if args.first().map(|arg|arg=="--connect-template-build").unwrap_or(false) {
+        if args.len()!=4 {
+            return Err("usage: probe_pcode --connect-template-build f_connect.fun <body_index> <catalog.grp>".into());
+        }
+        let index=args[2].parse::<usize>()?;
+        let parser=PblParser::new(EXE)?;
+        let entry=parser.entries().iter()
+            .find(|e|e.name.eq_ignore_ascii_case(&args[1]))
+            .ok_or_else(||format!("compiled entry not found: {}",args[1]))?;
+        let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+        let symbols=find_pcode_symbols(&data,index)?;
+        let lines=flow_instructions(&symbols.code)?;
+        let catalog=parse_system_objects(&std::fs::read(&args[3])?)?;
+        print_connect_template_build(&lines,&symbols,&catalog);
+        return Ok(());
     }
     if args.first().map(|arg|arg=="--connect-template-origin").unwrap_or(false) {
         if args.len()!=4 {
@@ -4670,6 +4789,26 @@ mod semantic_probe_tests {
         let mut unknown=lines.clone();
         unknown[5].opcode=0x020f;
         assert!(redacted_dbparm_expression(&unknown,&sym).is_err());
+    }
+
+    #[test]
+    fn local_assignment_extractor_rejects_branches_and_nested_starts() {
+        let mk=|pos,op,idx:u16|FlowInsn{
+            position:pos,end:pos+4,opcode:op,operands:idx.to_le_bytes().to_vec()
+        };
+        let good=vec![
+            mk(0x00b2,0x011d,8),mk(0x00b6,0x003b,0),
+            mk(0x00ba,0x013b,1),mk(0x00be,0x0088,0),
+            mk(0x00c2,0x0005,0)
+        ];
+        assert_eq!(local_assignment_at(&good,0x00b2,8).unwrap().len(),4);
+        assert!(local_assignment_at(&good,0x00b2,7).is_err());
+        let mut branch=good.clone();
+        branch[2].opcode=0x0003;
+        assert!(local_assignment_at(&branch,0x00b2,8).is_err());
+        let mut nested=good.clone();
+        nested[2].opcode=0x011d;
+        assert!(local_assignment_at(&nested,0x00b2,8).is_err());
     }
 
     #[test]
