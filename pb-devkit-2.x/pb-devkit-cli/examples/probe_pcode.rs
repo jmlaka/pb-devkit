@@ -4014,6 +4014,77 @@ fn local_assignment_at<'a>(
     Err(format!("no safe assignment end after 0x{at:04X}"))
 }
 
+// Compare the two pre-CONNECT ls_pom builders instruction-by-instruction.
+// Unlike generic DBParm comparison, a string constant may be replaced by
+// a named string local (e.g. a caller-provided configuration argument).
+// Equality checks are performed only in memory; no constant contents,
+// lengths, hashes, or source offsets into pools are emitted.
+fn preconnect_builder_comparison(
+    mode_a:&[FlowInsn],mode_b:&[FlowInsn],sym:&FunctionSymbols,
+) -> Result<Vec<String>,&'static str> {
+    if mode_a.len()!=mode_b.len() {
+        return Err("different instruction counts; no position alignment");
+    }
+    let mut rows=Vec::new();
+    let mut strings_a=0usize;
+    let mut strings_b=0usize;
+    let mut unchanged_nonconstants=0usize;
+    let mut changed_operands=0usize;
+    for (slot,(a,b)) in mode_a.iter().zip(mode_b).enumerate() {
+        if a.opcode==0x003b {strings_a+=1;}
+        if b.opcode==0x003b {strings_b+=1;}
+        match (a.opcode,b.opcode) {
+            (0x003b,0x003b)=>{
+                let eq=dbparm_constant_equality(sym,a,b).label();
+                rows.push(format!(
+                    "  Instruction #{}: A string #{} vs B string #{}: {}",
+                    slot+1,strings_a,strings_b,eq));
+            },
+            (0x0034,0x0034)=>{
+                rows.push(format!("  Instruction #{}: integer constant: {}",
+                    slot+1,dbparm_constant_equality(sym,a,b).label()));
+            },
+            (0x003b,0x001e)|(0x003b,0x0030)|(0x003b,0x01a9)|(0x003b,0x0150)=>{
+                let idx=flow_operand_word(&b.operands,0);
+                let Some(name)=sym.locals.get(idx)
+                    .map(|v|gate_symbol_name(&v.name)) else {
+                    return Err("one replacement local index is invalid");
+                };
+                if name=="<unnamed>" {return Err("one replacement local name unresolved");}
+                rows.push(format!(
+                    "  Instruction #{}: A string #{} replaced by B local {}",
+                    slot+1,strings_a,name));
+            },
+            (0x001e,0x003b)|(0x0030,0x003b)|(0x01a9,0x003b)|(0x0150,0x003b)=>{
+                let idx=flow_operand_word(&a.operands,0);
+                let Some(name)=sym.locals.get(idx)
+                    .map(|v|gate_symbol_name(&v.name)) else {
+                    return Err("one replacement local index is invalid");
+                };
+                if name=="<unnamed>" {return Err("one replacement local name unresolved");}
+                rows.push(format!(
+                    "  Instruction #{}: A local {} replaced by B string #{}",
+                    slot+1,name,strings_b));
+            },
+            _ if dbparm_instruction_shape_matches(sym,a,b)=>{
+                unchanged_nonconstants+=1;
+            },
+            _=>{
+                changed_operands+=1;
+                rows.push(format!(
+                    "  Instruction #{}: different nonconstant opcode/operand semantics (unresolved)",
+                    slot+1));
+            }
+        }
+    }
+    let total=mode_a.len();
+    rows.insert(0,format!(
+        "  Instruction alignment: {} positions; unchanged nonconstant operations: {}; other structural differences: {}",
+        total,unchanged_nonconstants,changed_operands
+    ));
+    Ok(rows)
+}
+
 fn print_connect_template_build(
     lines:&[FlowInsn],sym:&FunctionSymbols,
     catalog:&[SystemCatalogObject],
@@ -4085,7 +4156,12 @@ fn print_connect_template_build(
             println!("  String-slot equality (A vs B): {}",format_result(&string_eq));
             println!("  Integer-slot equality (A vs B): {}",format_result(&integer_eq));
         } else {
-            println!("  Constant slots not compared across different structures.");
+            println!("  Constant slots not compared as a single identical structure.");
+            println!("  Position-aligned, redacted comparison:");
+            match preconnect_builder_comparison(left,right,sym) {
+                Ok(lines)=>for line in lines {println!("{line}");},
+                Err(reason)=>println!("  Not comparable: {reason}"),
+            }
         }
     }
     println!("No connection was attempted and no DBParm string was evaluated.");
@@ -4789,6 +4865,46 @@ mod semantic_probe_tests {
         let mut unknown=lines.clone();
         unknown[5].opcode=0x020f;
         assert!(redacted_dbparm_expression(&unknown,&sym).is_err());
+    }
+
+    #[test]
+    fn preconnect_builder_compare_handles_constant_replaced_by_local() {
+        let mut pool=vec![0u8;16];
+        let mut offsets=Vec::<u32>::new();
+        for value in ["same-template-part","different-part"] {
+            offsets.push(pool.len() as u32);
+            for u in value.encode_utf16().chain(std::iter::once(0)) {
+                pool.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        let sym=FunctionSymbols{
+            code:Vec::new(),stack_buffer:pool,
+            locals:vec![VariableSymbol {
+                name:"as_promis_ini".into(),type_id:0x0006,global_index:None,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mk=|pos,opcode,operands:Vec<u8>|FlowInsn{
+            position:pos,end:pos+2+operands.len(),opcode,operands
+        };
+        let a=vec![
+            mk(0,0x003b,offsets[0].to_le_bytes().to_vec()),
+            mk(6,0x003b,offsets[1].to_le_bytes().to_vec()),
+            mk(12,0x0034,4i32.to_le_bytes().to_vec()),
+            mk(18,0x007d,vec![]),
+        ];
+        let b=vec![
+            mk(200,0x003b,offsets[0].to_le_bytes().to_vec()),
+            mk(206,0x001e,vec![0,0]),
+            mk(210,0x0034,4i32.to_le_bytes().to_vec()),
+            mk(216,0x007d,vec![]),
+        ];
+        let output=preconnect_builder_comparison(&a,&b,&sym).unwrap().join("\n");
+        assert!(output.contains("A string #1 vs B string #1: same"));
+        assert!(output.contains("A string #2 replaced by B local as_promis_ini"));
+        assert!(output.contains("integer constant: same"));
+        assert!(!output.contains("different-part"));
     }
 
     #[test]
