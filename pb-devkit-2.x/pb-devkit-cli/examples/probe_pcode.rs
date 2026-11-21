@@ -1502,14 +1502,99 @@ fn compiled_function_name_matches(actual:&str, requested:&str) -> bool {
             .is_some_and(|stem|stem.eq_ignore_ascii_case(requested))
 }
 
+// Provenance for arguments of an immediate PB333 function call.
+// Reverse-slice only expressions supported by this minimal, verified
+// stack model. On unsupported code we report unresolved, never guess.
+// Deliberately do not reveal compiled literal values (not even with
+// --show-sensitive): this mode is for input provenance, not credentials.
+fn call_argument_stack_sources(
+    lines:&[FlowInsn],call_push_index:usize,sym:&FunctionSymbols,
+    expected_arity:usize,
+) -> Result<Vec<String>,String> {
+    let push=lines.get(call_push_index).ok_or("call instruction index missing")?;
+    let next=lines.get(call_push_index+1).ok_or("call execution instruction missing")?;
+    if push.opcode!=0x01bc || next.opcode!=0x01bd ||
+        flow_operand_word(&next.operands,2)!=expected_arity ||
+        expected_arity==0 || expected_arity>16
+    {return Err("expected adjacent function push and call with verified arity".into());}
+    let mut needed=expected_arity;
+    let mut start=None;
+    let lower=call_push_index.saturating_sub(192);
+    for i in (lower..call_push_index).rev() {
+        let ins=&lines[i];
+        let pop_count=match ins.opcode {
+            0x001e|0x0030|0x01a9|0x0150|
+            0x002f|0x011f|0x0032..=0x003d|
+            0x01ff|0x0020|0x01bc => {
+                if needed==0 {return Err("negative reverse stack demand".into());}
+                needed-=1;
+                0usize
+            },
+            0x007d|0x0055|0x005c|0x00a8|0x00ad|
+            0x00b8|0x00c8|0x00ec|0x0025|
+            0x0027|0x0122 => 1,
+            0x0199|0x01a4|0x0195|
+            0x003f|0x008e|0x0139|
+            0x0123..=0x012b|0x012d..=0x013e=>0,
+            0x01bd=>{
+                let arity=flow_operand_word(&ins.operands,2);
+                if arity>16 {return Err("nested function arity exceeds limit".into());}
+                arity
+            },
+            _=>return Err(format!(
+                "unsupported opcode 0x{:04X} in argument expression at 0x{:04X}",
+                ins.opcode,ins.position)),
+        };
+        needed=needed.checked_add(pop_count)
+            .ok_or("reverse stack demand overflow")?;
+        if needed>64 {return Err("argument expression stack demand too large".into());}
+        if needed==0 {start=Some(i);break;}
+    }
+    let start=start.ok_or("argument sources exceed safe 192-instruction window")?;
+    let mut stack=Vec::new();
+    for ins in &lines[start..call_push_index] {
+        match ins.opcode {
+            0x0034=>stack.push("<integer literal>".to_string()),
+            0x003b=>{
+                let category=ins.operands.get(..4).and_then(|bytes|{
+                    let off=u32::from_le_bytes([bytes[0],bytes[1],bytes[2],bytes[3]]);
+                    utf16_string(&sym.stack_buffer,off)
+                }).map(|value|if value.is_empty() {
+                    "<empty string literal>"
+                } else {
+                    "<nonempty string literal>"
+                }).unwrap_or("<unresolved string literal>");
+                stack.push(category.to_string());
+            },
+            0x0032..=0x003a|0x003c|0x003d|0x01ff=>
+                stack.push("<other literal>".to_string()),
+            _=>{
+                if flow_statement(ins,sym,&mut stack,false).is_some() {
+                    return Err(format!("unexpected statement within argument slice at 0x{:04X}",ins.position));
+                }
+            },
+        }
+        if stack.len()>64 {return Err("argument stack exceeds 64 items".into());}
+    }
+    if stack.len()!=expected_arity ||
+        stack.iter().any(|x|x.contains("<missing")||x.contains("<invalid"))
+    {return Err("argument stack not fully resolved".into());}
+    Ok(stack)
+}
+
 fn scan_compiled_function_callers(
-    parser:&PblParser, target:&str,
+    parser:&PblParser, target:&str, show_argument_sources:bool,
 ) -> Result<(),Box<dyn std::error::Error>> {
     const SUFFIXES:&[&str]=&[".fun",".win",".apl",".udo"];
     println!("=== DIRECT PB333 FUNCTION CALLERS (METADATA ONLY) ===");
     println!("Target: {target}");
     println!("Shows entry, body, call-site offset and compiled call arity.");
-    println!("No arguments, strings, passwords or connection parameters are displayed.");
+    if show_argument_sources {
+        println!("Only arg #3 and #6 sources are shown, never literal contents.");
+        println!("Direct argument stack slicing; unresolved means no safe inference.");
+    } else {
+        println!("No arguments, strings, passwords or connection parameters are displayed.");
+    }
     let mut entries_considered=0usize;
     let mut entries_skipped=0usize;
     let mut matching_call_sites=0usize;
@@ -1556,6 +1641,25 @@ fn scan_compiled_function_callers(
                     entry.name,body,ins.position,
                     arity.map(|a|a.to_string())
                         .unwrap_or_else(||"unverified".to_string()));
+                if show_argument_sources {
+                    if arity!=Some(6) {
+                        println!("  Arg provenance unresolved: six-argument call not verified");
+                    } else {
+                        match call_argument_stack_sources(&lines,i,&symbols,6) {
+                            Ok(args)=>{
+                                for (argno,label) in [(3usize,"as_promis_ini"),(6usize,"as_conname")] {
+                                    let value=&args[argno-1];
+                                    if value.len()>300 {
+                                        println!("  arg #{argno} ({label}): expression too complex to display");
+                                    } else {
+                                        println!("  arg #{argno} ({label}) source: {value}");
+                                    }
+                                }
+                            },
+                            Err(reason)=>println!("  Arg provenance unresolved: {reason}"),
+                        }
+                    }
+                }
             }
         }
     }
@@ -4662,12 +4766,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let parser=PblParser::new(EXE)?;
         return inspect_connection_sites(&parser,&args[1],index,catalog.as_deref(),show_sensitive);
     }
+    if args.first().map(|arg|arg=="--caller-args").unwrap_or(false) {
+        if args.len()!=2 {
+            return Err("usage: probe_pcode --caller-args <function_name>".into());
+        }
+        let parser=PblParser::new(EXE)?;
+        return scan_compiled_function_callers(&parser,&args[1],true);
+    }
     if args.first().map(|arg|arg=="--callers").unwrap_or(false) {
         if args.len()!=2 {
             return Err("usage: probe_pcode --callers <function_name>".into());
         }
         let parser=PblParser::new(EXE)?;
-        return scan_compiled_function_callers(&parser,&args[1]);
+        return scan_compiled_function_callers(&parser,&args[1],false);
     }
     if args.first().map(|arg|arg=="--db-scan").unwrap_or(false) {
         if args.len()!=1 {
@@ -4988,6 +5099,37 @@ mod semantic_probe_tests {
         assert!(output.contains("A string #2 replaced by B local as_promis_ini"));
         assert!(output.contains("integer constant: same"));
         assert!(!output.contains("different-part"));
+    }
+
+    #[test]
+    fn call_argument_slice_proves_six_sources_and_empty_literal() {
+        let sym=FunctionSymbols{
+            code:Vec::new(),stack_buffer:vec![0;8],
+            locals:vec![VariableSymbol{
+                name:"my_conname".to_string(),global_index:None,type_id:6,
+            }],
+            globals:Vec::new(),referenced_functions:vec!["f_connect".into()],
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mk=|position:usize,opcode:u16,operands:Vec<u8>|FlowInsn{
+            position,end:position+2+operands.len(),opcode,operands,
+        };
+        let mut seq=vec![
+            mk(0,0x003b,vec![0;4]),
+            mk(6,0x003b,vec![0;4]),
+            mk(12,0x003b,vec![0;4]),
+            mk(18,0x003b,vec![0;4]),
+            mk(24,0x003b,vec![0;4]),
+            mk(30,0x001e,vec![0,0]),
+            mk(34,0x01bc,vec![0,0,1,0x80]),
+            mk(40,0x01bd,vec![0,0,6,0,0,0]),
+        ];
+        let args=call_argument_stack_sources(&seq,6,&sym,6).unwrap();
+        assert_eq!(args.len(),6);
+        assert_eq!(args[2],"<empty string literal>");
+        assert_eq!(args[5],"my_conname");
+        seq[3].opcode=0x011d;
+        assert!(call_argument_stack_sources(&seq,6,&sym,6).is_err());
     }
 
     #[test]
