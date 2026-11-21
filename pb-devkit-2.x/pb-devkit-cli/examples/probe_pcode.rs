@@ -2487,7 +2487,7 @@ fn report_system_catalog(objects:&[SystemCatalogObject], source:&str) {
         Some(trans)=>{
             println!("\nTransaction class: type=0x{:04X}, parent=0x{:04X}, all fields={}",
                 trans.type_id,trans.parent_type,trans.all_member_count);
-            for idx in [2usize,14,15] {
+            for idx in [2usize,9,14,15] {
                 let field=system_property_name(objects,trans.type_id,idx,0)
                     .unwrap_or_else(||"<unresolved>".into());
                 println!("  PB P-code member #{idx}: {field}");
@@ -2559,7 +2559,7 @@ fn transaction_catalog_scan(parser:&PblParser) -> Result<(),Box<dyn std::error::
     if let Some(trans)=transaction {
         println!("Transaction: type=0x{:04X}, inherited type=0x{:04X}, all members={}",
             trans.type_id,trans.parent_type,trans.all_member_count);
-        for index in [2usize,14,15] {
+        for index in [2usize,9,14,15] {
             let result=system_property_name(&objects,trans.type_id,index,0)
                 .unwrap_or_else(||"<unresolved, inherited catalog may be absent>".into());
             println!("  member #{index}: {result}");
