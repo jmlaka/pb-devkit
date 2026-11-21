@@ -2499,6 +2499,17 @@ fn print_post_connect_sql_trace(
                         println!("    Candidate assignment 0x{:04X}..0x{:04X}",
                             begin.position,block[end_idx].position);
                         let complete_assignment=&block[begin_idx..=end_idx];
+                        // A direct source read and ResetAssign are stronger
+                        // provenance evidence than a literal keyword alone.
+                        // This does not model indirect aliases or called code.
+                        let reads_previous=complete_assignment.iter().skip(1).any(|ins|
+                            matches!(ins.opcode,0x001e|0x0030|0x01a9|0x0150) &&
+                            flow_operand_word(&ins.operands,0)==source_idx);
+                        let reset_count=complete_assignment.iter()
+                            .filter(|ins|ins.opcode==0x0119).count();
+                        println!("      Prior local source read: {}",
+                            if reads_previous {"yes"} else {"no direct read found"});
+                        println!("      ResetAssign instructions in this assignment: {reset_count}");
                         if let Some((count,joined))=recognized_literal_append(
                             complete_assignment,sym,show_sensitive
                         ) {
