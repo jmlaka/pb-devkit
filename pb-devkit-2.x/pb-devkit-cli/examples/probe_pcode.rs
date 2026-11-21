@@ -3797,6 +3797,141 @@ fn pb333_signature_from_record(
 // retain the 4-byte body-index records and 48-byte function definitions.
 // PbdViewer ReadFunction() maps body index bytes +2 to definition index.
 // The function and parameter pools are metadata only.
+// Read the raw 20-byte PB333 local-variable declaration records for one
+// P-code body. The records and pool are kept in memory only; caller prints
+// strictly categorical initializer metadata, never compiled fragments.
+fn pb333_body_local_declarations(
+    data:&[u8],selected:usize,
+)->Result<(Vec<[u8;20]>,Vec<u8>),String> {
+    let mut r=Cursor::new(data);
+    if r.u16()?!=333 {return Err("not a PB333 compiled entry".into());}
+    r.bytes(22)?;
+    let descriptors=r.u16()? as usize;
+    r.bytes(descriptors.checked_mul(12).ok_or("descriptor count overflow")?)?;
+    r.struct_buffer()?;
+    r.records20()?;
+    let object_count=r.u16()? as usize;
+    let extended_count=r.u16()? as usize;
+    r.struct_buffer()?;
+    r.struct_buffer()?;
+    named_types(&mut r)?;
+    r.records20()?;
+    let indices=r.bytes(object_count.checked_mul(16)
+        .ok_or("object count overflow")?)?.to_vec();
+    let extended=r.bytes(extended_count.checked_mul(32)
+        .ok_or("extended count overflow")?)?.to_vec();
+    let mut used_extended=0usize;
+    let mut body_index=0usize;
+    for index in indices.chunks_exact(16) {
+        match (index[0]>>1)&7 {
+            0=>{
+                let offset=used_extended.checked_mul(32)
+                    .ok_or("extended header offset overflow")?;
+                let header=extended.get(offset..offset+32)
+                    .ok_or("missing extended object header")?;
+                used_extended+=1;
+                let count=r.u16()? as usize;
+                r.bytes(count.checked_mul(4).ok_or("body count overflow")?)?;
+                for _ in 0..count {
+                    let code_length=r.u16()? as usize;
+                    let debug_count=r.u16()? as usize;
+                    r.u16()?;
+                    r.bytes(code_length)?;
+                    r.bytes(debug_count.checked_mul(4)
+                        .ok_or("debug count overflow")?)?;
+                    if body_index==selected {
+                        r.bytes(6)?;
+                        let _names=pool_buffer(&mut r)?;
+                        let records_size=r.u16()? as usize;
+                        if records_size%20!=0 {
+                            return Err("local declaration records not 20-byte aligned".into());
+                        }
+                        let raw=r.bytes(records_size)?;
+                        let records=raw.chunks_exact(20).map(|part|{
+                            let mut record=[0u8;20];
+                            record.copy_from_slice(part);
+                            record
+                        }).collect::<Vec<_>>();
+                        let values=pool_buffer(&mut r)?;
+                        return Ok((records,values));
+                    }
+                    r.records20()?;
+                    r.struct_buffer()?;
+                    body_index+=1;
+                }
+                r.bytes(word(header,24)?*6)?;
+                r.bytes(word(header,22)?*4)?;
+                named_references(&mut r)?;
+                r.records20()?;
+                r.bytes(word(header,28)?*8)?;
+                r.bytes(word(header,26)?*16)?;
+                r.bytes(word(header,4)?*48)?;
+            },
+            1=>{r.bytes(word(index,4)?*8)?;},
+            _=>{},
+        }
+    }
+    Err(format!("P-code body index {selected} not found"))
+}
+
+// PbdViewer PbVariable.GetValue(): byte 17 bit 0 indicates an initial
+// value, record bytes 12..16 contain the in-pool value/reference for
+// primitive strings. Nonempty values remain wholly private in memory.
+fn pb333_string_initializer_category(
+    record:&[u8;20],pool:&[u8],
+)->&'static str {
+    let flags=record[17];
+    if flags&1==0 {
+        return "no explicit initializer flag (default empty string)";
+    }
+    if record[0]&2!=0 || record[16]&0x40!=0 || flags&32!=0 {
+        return "initializer unresolved (indirect/global/array)";
+    }
+    if flags&0x0c==0x0c {
+        return "initializer flagged invalid (unresolved)";
+    }
+    let ptr=u32::from_le_bytes([
+        record[12],record[13],record[14],record[15]
+    ]);
+    match utf16_string(pool,ptr) {
+        Some(value) if value.is_empty()=>
+            "compiled empty-string initializer",
+        Some(_)=>"compiled nonempty-string initializer",
+        None=>"initializer pointer unresolved",
+    }
+}
+
+fn print_heslo_initializers(
+    sym:&FunctionSymbols,records:&[[u8;20]],pool:&[u8],
+) -> Result<(),String> {
+    println!("=== F_HESLO LOCAL STRING INITIALIZERS (REDACTED) ===");
+    println!("Only flags and empty/nonempty categories. Never any literal content,");
+    println!("length, hashes, offsets, or derived runtime connection parameters.");
+    if records.len()!=sym.locals.len() {
+        return Err(format!("local declaration count mismatch: {} vs {}",
+            records.len(),sym.locals.len()));
+    }
+    for (index,variable) in sym.locals.iter().enumerate() {
+        let target=["ls_v","ls_g","ls_pom1","ls_pom3"];
+        if !target.iter().any(|name|variable.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        let record=&records[index];
+        let type_id=u16::from_le_bytes([record[18],record[19]]);
+        if type_id!=variable.type_id || type_id!=0x0006 {
+            println!("  {}: type mismatch; initializer not classified",
+                gate_symbol_name(&variable.name));
+            continue;
+        }
+        println!("  {}: {}",
+            gate_symbol_name(&variable.name),
+            pb333_string_initializer_category(record,pool));
+    }
+    println!("No P-code assignments to these four variables were found in body 0;");
+    println!("declaration-time initial values are a separate source of data.");
+    Ok(())
+}
+
 fn pb333_formal_signature(
     data:&[u8],selected:usize,
 )->Result<Pb333FormalSignature,String> {
@@ -3981,6 +4116,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.len()!=1 {return Err("usage: probe_pcode --transaction-catalog".into());}
         let parser=PblParser::new(EXE)?;
         return transaction_catalog_scan(&parser);
+    }
+    if args.first().map(|arg|arg=="--heslo-initializers").unwrap_or(false) {
+        if args.len()!=3 {
+            return Err("usage: probe_pcode --heslo-initializers f_heslo.fun <body_index>".into());
+        }
+        let index=args[2].parse::<usize>()?;
+        let parser=PblParser::new(EXE)?;
+        let entry=parser.entries().iter()
+            .find(|e|e.name.eq_ignore_ascii_case(&args[1]))
+            .ok_or_else(||format!("compiled entry not found: {}",args[1]))?;
+        let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+        let symbols=find_pcode_symbols(&data,index)?;
+        let (records,pool)=pb333_body_local_declarations(&data,index)?;
+        print_heslo_initializers(&symbols,&records,&pool)?;
+        return Ok(());
     }
     if args.first().map(|arg|arg=="--function-signature").unwrap_or(false) {
         if args.len()!=3 {
@@ -4342,6 +4492,31 @@ mod semantic_probe_tests {
             "default branch");
         lines.iter_mut().find(|v|v.position==0x005e).unwrap().opcode=0x0002;
         assert!(pb333_heslo_username_branch_strings(&lines,&sym).is_none());
+    }
+
+    #[test]
+    fn heslo_string_initializer_categories_do_not_expose_compiled_values() {
+        let mut pool=vec![0u8;16];
+        for unit in "private-test-fragment".encode_utf16().chain(std::iter::once(0)) {
+            pool.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut record=[0u8;20];
+        record[18..20].copy_from_slice(&6u16.to_le_bytes());
+        assert_eq!(pb333_string_initializer_category(&record,&pool),
+            "no explicit initializer flag (default empty string)");
+        record[17]=1;
+        record[12..16].copy_from_slice(&16u32.to_le_bytes());
+        assert_eq!(pb333_string_initializer_category(&record,&pool),
+            "compiled nonempty-string initializer");
+        record[12..16].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(pb333_string_initializer_category(&record,&pool),
+            "compiled empty-string initializer");
+        record[12..16].copy_from_slice(&0x00ff_ffffu32.to_le_bytes());
+        assert_eq!(pb333_string_initializer_category(&record,&pool),
+            "initializer pointer unresolved");
+        record[17]=1|32;
+        assert_eq!(pb333_string_initializer_category(&record,&pool),
+            "initializer unresolved (indirect/global/array)");
     }
 
     #[test]
