@@ -99,3 +99,32 @@ credentials.
 itself is executed. This tool is static and does not execute it. A successful
 connection does not establish that the subsequent dynamic statement is
 read-only or that its result is checked before the \`0\` return.
+
+
+## Inspect post-CONNECT EXECUTE IMMEDIATE without SQL disclosure
+
+After successful connection, \`f_connect.fun\` contains an
+\`SqlExecuteImmediate\` instruction at \`0x0660\`. The SQL text is supplied by
+local variable \`ls_pom\`, using local transaction \`at_sql\`. This is a
+potentially writing operation; running the application just to inspect it is
+not recommended.
+
+Static, offline analysis:
+
+```bash
+cargo test -p pb-devkit-cli --example probe_pcode
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --post-connect-sql f_connect.fun 0
+```
+
+Only sanitized instruction metadata, symbol names, known referenced function
+names, and **coarse allowlisted SQL-looking literal-prefix classes** are
+reported. No SQL text, literal fragments, credentials or query parameters are
+emitted. A prefix category found in a literal is **not evidence** that the
+resulting SQL command has that category: SQL strings can be constructed
+dynamically. The analysis performs no database operations.
+
+For production read-only access, create a separately authorized, minimally
+privileged database user and verify read-only permissions at the database
+server, rather than relying on application-level flags or reverse-engineered
+query text.
