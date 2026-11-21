@@ -84,7 +84,7 @@ def validate_no_clear_credential_fields(text: str) -> None:
     Users must redact sensitive fragments BEFORE constructing the recipe.
     """
     for match in re.finditer(
-        r"(?i)(?:^|[;,\s])(?:UID|PWD|LOGID|LOGPASS|PASSWORD|USERID)\s*=\s*",
+        r"(?i)(?<![A-Za-z0-9_])(?:UID|PWD|LOGID|LOGPASS|PASSWORD|USERID)\s*=\s*",
         text,
     ):
         remainder = text[match.end():]
@@ -167,6 +167,8 @@ class StringOperationsTests(unittest.TestCase):
             validate_no_clear_credential_fields("DSN=EXAMPLE;PWD=secret;")
         with self.assertRaises(ValueError):
             validate_no_clear_credential_fields("UID=example;PWD=<REDACTED>")
+        with self.assertRaises(ValueError):
+            validate_no_clear_credential_fields("ConnectString=\'UID=private;PWD=private\'")
 
 
 if __name__ == "__main__":
