@@ -1707,7 +1707,62 @@ fn preconnect_branch_gates(lines:&[FlowInsn])
     gates
 }
 
-fn print_preconnect_routing(lines:&[FlowInsn]) {
+// A single-block, redacted symbolic reconstruction of a branch condition.
+// Reconstruct only operations from the nearest basic-block boundary, refusing
+// to guess a value that arrives from a predecessor block. Numeric and string
+// literals are both suppressed. No call is executed; only opcode metadata is
+// read. The full condition is shown only when the stack is fully resolved.
+fn redacted_entry_gate_predicate(
+    lines:&[FlowInsn], sym:&FunctionSymbols, branch_position:usize
+) -> String {
+    use std::collections::BTreeSet;
+    let mut boundaries=BTreeSet::new();
+    boundaries.insert(0usize);
+    for ins in lines {
+        if matches!(ins.opcode,0x0002|0x0003|0x0004) {
+            boundaries.insert(flow_operand_word(&ins.operands,0));
+        }
+        if matches!(ins.opcode,0x0000..=0x0004) {
+            boundaries.insert(ins.end);
+        }
+    }
+    let Some(begin)=boundaries.range(..=branch_position).next_back().copied()
+        else {return "<unresolved: no basic block boundary>".into();};
+    let mut stack=Vec::<String>::new();
+    let mut unsupported=false;
+    let mut inspected=false;
+    for ins in lines.iter()
+        .filter(|ins|ins.position>=begin && ins.position<=branch_position) {
+        if ins.position==branch_position {
+            if !matches!(ins.opcode,0x0002|0x0003) {
+                return "<unresolved: target is not a conditional branch>".into();
+            }
+            inspected=true;
+            break;
+        }
+        if ins.opcode==0x0034 {
+            stack.push("<number-hidden>".into());
+            continue;
+        }
+        if let Some(stmt)=flow_statement(ins,sym,&mut stack,false) {
+            if stmt.starts_with("/* unknown stack semantics") {
+                unsupported=true;
+            }
+        }
+    }
+    if !inspected || unsupported || stack.len()!=1 {
+        return format!("<unresolved predicate; block 0x{begin:04X}..0x{branch_position:04X}>");
+    }
+    let condition=stack.pop().unwrap_or_default();
+    if condition.contains("<missing-stack-value>") ||
+        condition.contains("<string-offset-unresolved>") ||
+        condition.contains("<invalid-") {
+        return format!("<partially unresolved; block 0x{begin:04X}..0x{branch_position:04X}>");
+    }
+    condition
+}
+
+fn print_preconnect_routing(lines:&[FlowInsn], sym:&FunctionSymbols) {
     println!("\n=== CONNECT ENTRY ROUTING (STATIC, REDACTED) ===");
     println!("Explores both outcomes of unknown conditions; stops at first CONNECT or RETURN.");
     let endpoints=next_connect_endpoints(lines,0);
@@ -1721,6 +1776,10 @@ fn print_preconnect_routing(lines:&[FlowInsn]) {
     println!("Branch decisions that distinguish first CONNECT/RETURN destinations:");
     for (offset,jump,jumps,falls) in gates.iter().take(40) {
         println!("  Branch at 0x{offset:04X}:");
+        let predicate=redacted_entry_gate_predicate(lines,sym,*offset);
+        let op=lines.iter().find(|ins|ins.position==*offset).map(|ins|ins.opcode);
+        let condition=if op==Some(0x0003) {"IF NOT"} else {"IF"};
+        println!("    {} {} (all constants redacted)",condition,predicate);
         println!("    jump -> 0x{jump:04X}: {}",
             if jumps.is_empty() {"<none>".to_string()} else {jumps.join(", ")});
         println!("    fallthrough -> {}",
@@ -1898,7 +1957,7 @@ fn inspect_connection_sites(
     println!("not necessarily the direct origin of a specific credential value.");
     println!("For exact data-flow, follow the property-assignment stack backwards.");
     print_connection_control_flow(&lines,&symbols,system_catalog,&connect_indices);
-    print_preconnect_routing(&lines);
+    print_preconnect_routing(&lines,&symbols);
     Ok(())
 }
 
@@ -2452,6 +2511,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+    #[test]
+    fn entry_gate_condition_is_redacted_and_preserves_variable_identity() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol {
+                name:"mode".into(),global_index:None,type_id:0x0001,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let lines=vec![
+            FlowInsn {position:0,end:4,opcode:0x0030,operands:vec![0,0]},
+            FlowInsn {position:4,end:10,opcode:0x0034,operands:vec![37,0,0,0]},
+            FlowInsn {position:10,end:12,opcode:0x00a8,operands:vec![]},
+            FlowInsn {position:12,end:16,opcode:0x0003,operands:vec![20,0]},
+        ];
+        let predicate=redacted_entry_gate_predicate(&lines,&sym,12);
+        assert_eq!(predicate,"(mode = <number-hidden>)");
+        assert!(!predicate.contains("37"));
+    }
+
+    #[test]
+    fn entry_gate_never_invents_condition_crossing_basic_block() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:Vec::new(),globals:Vec::new(),
+            referenced_functions:Vec::new(),sql_pool:Vec::new(),
+            type_names:Vec::new(),
+        };
+        let lines=vec![
+            FlowInsn {position:0,end:4,opcode:0x0004,operands:vec![10,0]},
+            FlowInsn {position:10,end:12,opcode:0x00a8,operands:vec![]},
+            FlowInsn {position:12,end:16,opcode:0x0002,operands:vec![20,0]},
+        ];
+        assert!(redacted_entry_gate_predicate(&lines,&sym,12)
+            .contains("partially unresolved"));
+    }
+
     #[test]
     fn entry_routing_stops_at_first_connection_and_identifies_alternative_gates() {
         let lines=vec![
