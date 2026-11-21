@@ -2897,6 +2897,142 @@ fn dbparm_completed_assignments(
     found
 }
 
+// Only report equality of compiled constants between catalog-verified
+// DBParm assignment candidates. No literal text, length, digest, value,
+// address, or runtime credential is ever emitted.
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+enum RedactedEquality {
+    Same,
+    Different,
+    Unresolved,
+}
+
+impl RedactedEquality {
+    fn label(self)->&'static str {
+        match self {
+            Self::Same=>"same",
+            Self::Different=>"different",
+            Self::Unresolved=>"unresolved",
+        }
+    }
+}
+
+fn dbparm_constant_equality(
+    sym:&FunctionSymbols,a:&FlowInsn,b:&FlowInsn,
+) -> RedactedEquality {
+    if a.opcode!=b.opcode {return RedactedEquality::Unresolved;}
+    match a.opcode {
+        0x003b=>{
+            let string_at=|ins:&FlowInsn|->Option<String> {
+                let bytes=ins.operands.get(..4)?;
+                let ptr=u32::from_le_bytes([bytes[0],bytes[1],bytes[2],bytes[3]]);
+                utf16_string(&sym.stack_buffer,ptr)
+            };
+            match (string_at(a),string_at(b)) {
+                (Some(x),Some(y)) if x==y=>RedactedEquality::Same,
+                (Some(_),Some(_))=>RedactedEquality::Different,
+                _=>RedactedEquality::Unresolved,
+            }
+        },
+        0x0034=>match (operand_i32(&a.operands),operand_i32(&b.operands)) {
+            (Some(x),Some(y)) if x==y=>RedactedEquality::Same,
+            (Some(_),Some(_))=>RedactedEquality::Different,
+            _=>RedactedEquality::Unresolved,
+        },
+        _=>RedactedEquality::Unresolved,
+    }
+}
+
+// Do not compare function reference-table indices directly: the same
+// referenced function may have a different index in each call site.
+fn dbparm_instruction_shape_matches(
+    sym:&FunctionSymbols,a:&FlowInsn,b:&FlowInsn,
+)->bool {
+    if a.opcode!=b.opcode {return false;}
+    match a.opcode {
+        0x0034|0x003b=>true, // constants are compared separately
+        0x01bc=>{
+            let owner_a=flow_operand_word(&a.operands,2);
+            let owner_b=flow_operand_word(&b.operands,2);
+            if owner_a!=owner_b {return false;}
+            if owner_a&0x8000!=0 {
+                let name_a=sym.referenced_functions.get(
+                    flow_operand_word(&a.operands,0));
+                let name_b=sym.referenced_functions.get(
+                    flow_operand_word(&b.operands,0));
+                name_a.is_some() && name_a==name_b
+            } else {
+                flow_operand_word(&a.operands,0)==
+                flow_operand_word(&b.operands,0)
+            }
+        },
+        // The first word can identify a different reference-table entry.
+        // The second is the arity; preserve the remaining call flags.
+        0x01bd=>a.operands.get(2..)==b.operands.get(2..),
+        _=>a.operands==b.operands,
+    }
+}
+
+fn compare_dbparm_constant_slots(
+    lines:&[FlowInsn],sym:&FunctionSymbols,
+    left:(usize,usize),right:(usize,usize),
+)->Result<(Vec<RedactedEquality>,Vec<RedactedEquality>),&'static str> {
+    let a=lines.get(left.0..=left.1).ok_or("invalid left assignment span")?;
+    let b=lines.get(right.0..=right.1).ok_or("invalid right assignment span")?;
+    if a.len()!=b.len() {return Err("different instruction counts");}
+    if !a.iter().zip(b).all(|(x,y)|dbparm_instruction_shape_matches(sym,x,y)) {
+        return Err("different opcode, operand, or function-call structure");
+    }
+    let mut strings=Vec::new();
+    let mut integers=Vec::new();
+    for (x,y) in a.iter().zip(b) {
+        match x.opcode {
+            0x003b=>strings.push(dbparm_constant_equality(sym,x,y)),
+            0x0034=>integers.push(dbparm_constant_equality(sym,x,y)),
+            _=>{},
+        }
+    }
+    Ok((strings,integers))
+}
+
+fn print_dbparm_redacted_comparisons(
+    lines:&[FlowInsn],sym:&FunctionSymbols,
+    assignments:&[(usize,usize,usize)],
+) {
+    println!("\n=== DBPARM CONSTANT COMPARISON (REDACTED) ===");
+    println!("Same/different/unresolved only; no values, lengths or hashes.");
+    println!("Comparison is of compiled constants, not runtime DBParm output.");
+    // In f_connect.fun, these pairs correspond to initial/retry calls
+    // in two modes, then cross-mode initial and cross-mode retry.
+    for (a,b,description) in [
+        (0usize,1usize,"first initial vs retry"),
+        (2,3,"second initial vs retry"),
+        (0,2,"initial vs initial"),
+        (1,3,"retry vs retry"),
+    ] {
+        let (Some(&(left_connect,left_start,left_end)),
+             Some(&(right_connect,right_start,right_end)))=
+             (assignments.get(a),assignments.get(b)) else {continue;};
+        println!("  {description}: CONNECT 0x{left_connect:04X} vs 0x{right_connect:04X}");
+        match compare_dbparm_constant_slots(
+            lines,sym,(left_start,left_end),(right_start,right_end)
+        ) {
+            Ok((strings,integers))=>{
+                println!("    Nonconstant structure: matches");
+                let format_slots=|values:&[RedactedEquality]|->String {
+                    if values.is_empty() {return "none".into();}
+                    values.iter().enumerate()
+                        .map(|(idx,v)|format!("{}:{}",idx+1,v.label()))
+                        .collect::<Vec<_>>().join(", ")
+                };
+                println!("    String slots: {}",format_slots(&strings));
+                println!("    Integer slots: {}",format_slots(&integers));
+            },
+            Err(reason)=>println!("    Not comparable: {reason}"),
+        }
+    }
+}
+
 fn print_dbparm_call_context(
     lines:&[FlowInsn],sym:&FunctionSymbols,
     catalog:&[SystemCatalogObject],
@@ -2907,7 +3043,7 @@ fn print_dbparm_call_context(
     println!("Lexical segments only; not proof of assignment execution on any branch.");
     let assignments=dbparm_completed_assignments(lines,sym,catalog);
     println!("Completed DBParm assignment candidates: {}",assignments.len());
-    for (connect,begin,end) in assignments {
+    for (connect,begin,end) in assignments.iter().copied() {
         let region=&lines[begin..=end];
         println!("\nCONNECT 0x{connect:04X} DBParm assignment 0x{:04X}..0x{:04X}:",
             lines[begin].position,lines[end].position);
@@ -2946,6 +3082,7 @@ fn print_dbparm_call_context(
         }
         if call_count==0 {println!("  No referenced function pushes identified.");}
     }
+    print_dbparm_redacted_comparisons(lines,sym,&assignments);
 }
 
 fn inspect_connection_sites(
@@ -3747,6 +3884,73 @@ mod semantic_probe_tests {
             Some((0x006a,0x00dc)));
         terminal.get_mut(&0x006a).unwrap().operands=vec![0xe8,0x00];
         assert_eq!(simple_structured_loop(&blocks,&terminal,blocks[1]),None);
+    }
+
+
+    #[test]
+    fn dbparm_literal_equality_compares_decoded_text_not_pointer_or_digest() {
+        let mut pool=vec![0u8;16];
+        let mut offsets=Vec::new();
+        for value in ["same","same","other"] {
+            offsets.push(pool.len() as u32);
+            for unit in value.encode_utf16().chain(std::iter::once(0)) {
+                pool.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:pool,locals:Vec::new(),
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mk=|pos:usize,offset:u32|FlowInsn {
+            position:pos,end:pos+6,opcode:0x003b,
+            operands:offset.to_le_bytes().to_vec(),
+        };
+        let a=mk(0,offsets[0]);
+        let b=mk(6,offsets[1]);
+        let c=mk(12,offsets[2]);
+        assert_ne!(a.operands,b.operands);
+        assert_eq!(dbparm_constant_equality(&sym,&a,&b),
+            RedactedEquality::Same);
+        assert_eq!(dbparm_constant_equality(&sym,&a,&c),
+            RedactedEquality::Different);
+        let unknown=mk(18,0xffff_ffff);
+        assert_eq!(dbparm_constant_equality(&sym,&a,&unknown),
+            RedactedEquality::Unresolved);
+    }
+
+    #[test]
+    fn dbparm_comparison_normalizes_named_calls_and_checks_integer_slots() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),locals:Vec::new(),
+            globals:Vec::new(),referenced_functions:vec![
+                "f_heslo".into(),"f_nahrad_znaky".into(),"f_heslo".into(),
+            ],sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mk=|op:u16,args:Vec<u8>|FlowInsn {
+            position:0,end:2+args.len(),opcode:op,operands:args,
+        };
+        let a=vec![
+            mk(0x0034,7i32.to_le_bytes().to_vec()),
+            mk(0x01bc,vec![0,0,1,0x80]),
+            mk(0x01bd,vec![0,0,2,0,0,0]),
+        ];
+        let b=vec![
+            mk(0x0034,8i32.to_le_bytes().to_vec()),
+            mk(0x01bc,vec![2,0,1,0x80]),
+            mk(0x01bd,vec![2,0,2,0,0,0]),
+        ];
+        let lines=a.into_iter().chain(b).collect::<Vec<_>>();
+        let (strings,integers)=compare_dbparm_constant_slots(
+            &lines,&sym,(0,2),(3,5)
+        ).unwrap();
+        assert!(strings.is_empty());
+        assert_eq!(integers,vec![RedactedEquality::Different]);
+        let mut altered=lines.clone();
+        altered[4].operands=vec![1,0,1,0x80]; // different function
+        assert!(compare_dbparm_constant_slots(
+            &altered,&sym,(0,2),(3,5)
+        ).is_err());
     }
 
     #[test]
