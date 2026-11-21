@@ -2336,6 +2336,135 @@ fn sql_literal_intent(literal:&str) -> Option<&'static str> {
 // PbdViewer's ResetAssign duplicates the pending l-value beneath the
 // right-hand expression. The final Add therefore uses the old variable
 // value plus the new literal expression; it does not overwrite from scratch.
+// Stack-exact, per-assignment reconstruction. No actual SQL is executed.
+// Stops at any unsupported operation rather than making up a source
+// expression. Each redacted token carries only its P-code offset, never
+// literal bytes, credentials or personal information.
+fn sql_assignment_expression(
+    instructions:&[&FlowInsn],sym:&FunctionSymbols,
+    catalog:Option<&[SystemCatalogObject]>,show_sensitive:bool,
+) -> Result<String,String> {
+    let first=instructions.first().ok_or("empty assignment")?;
+    if !matches!(first.opcode,0x011d|0x0120) {
+        return Err("first opcode is not BeginAssignLocalVariable".into());
+    }
+    let index=flow_operand_word(&first.operands,0);
+    let name=sym.locals.get(index)
+        .map(|var|gate_symbol_name(&var.name))
+        .ok_or("assignment local missing")?;
+    let mut stack=vec![name.to_string()];
+    let mut ended=false;
+    for (i,ins) in instructions.iter().enumerate().skip(1) {
+        let offset=ins.position;
+        let pop=|stack:&mut Vec<String>|stack.pop()
+            .ok_or_else(||format!("stack underflow at 0x{offset:04X}"));
+        match ins.opcode {
+            0x001e|0x0030|0x01a9|0x0150=>{
+                let pos=flow_operand_word(&ins.operands,0);
+                let value=sym.locals.get(pos)
+                    .map(|v|gate_symbol_name(&v.name).to_string())
+                    .unwrap_or_else(||format!("<local#{pos}>"));
+                stack.push(value);
+            },
+            0x003b=>{
+                let value=if show_sensitive {
+                    let raw=ins.operands.get(..4)
+                        .ok_or_else(||format!("invalid string reference at 0x{offset:04X}"))?;
+                    let ptr=u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+                    let actual=utf16_string(&sym.stack_buffer,ptr)
+                        .ok_or_else(||format!("unresolved string at 0x{offset:04X}"))?;
+                    format!("\"{}\"",actual.escape_debug())
+                } else {format!("<string@0x{offset:04X}>")};
+                stack.push(value);
+            },
+            0x0034=>{
+                let value=if show_sensitive {
+                    operand_i32(&ins.operands)
+                        .map(|v|v.to_string())
+                        .ok_or_else(||format!("invalid integer at 0x{offset:04X}"))?
+                } else {format!("<number@0x{offset:04X}>")};
+                stack.push(value);
+            },
+            0x0032|0x0033|0x0035..=0x003a|0x003c|0x003d|0x01ff=>{
+                stack.push(format!("<constant@0x{offset:04X}>"));
+            },
+            0x003f|0x008e|0x0123..=0x012b|0x012d..=0x013e=>{
+                // Version-mapped casts are stack-neutral in PbdViewer.
+            },
+            0x007d|0x005c|0x00a8|0x00ad|0x00b8=>{
+                let rhs=pop(&mut stack)?;
+                let lhs=pop(&mut stack)?;
+                let op=match ins.opcode {
+                    0x007d=>"+",0x005c=>"-",
+                    0x00a8|0x00ad=>"=",0x00b8=>"<>",_=>unreachable!(),
+                };
+                stack.push(format!("({lhs} {op} {rhs})"));
+            },
+            0x0199|0x01a4|0x0195=>{
+                let arg=pop(&mut stack)?;
+                let func=match ins.opcode {
+                    0x0199=>"Len",0x01a4=>"Upper",_=>"IsNull",
+                };
+                stack.push(format!("{func}({arg})"));
+            },
+            0x01bc=>{
+                let index=flow_operand_word(&ins.operands,0);
+                let owner=flow_operand_word(&ins.operands,2);
+                let function=if owner&0x8000!=0 {
+                    sym.referenced_functions.get(index)
+                        .map(|v|gate_symbol_name(v).to_string())
+                        .unwrap_or_else(||format!("function_ref_{index}"))
+                } else if owner==0x40d0 {
+                    catalog.and_then(|objects|objects.iter().find(|o|o.type_id==owner))
+                        .and_then(|obj|obj.function_definitions.get(index))
+                        .map(|name|gate_symbol_name(name).to_string())
+                        .unwrap_or_else(||format!("system_function_{index}"))
+                } else {format!("function_0x{owner:04X}_{index}")};
+                stack.push(function);
+            },
+            0x01bd=>{
+                let function=pop(&mut stack)?;
+                let count=flow_operand_word(&ins.operands,2);
+                if count>16 || count>stack.len() {
+                    return Err(format!("invalid call arity at 0x{offset:04X}"));
+                }
+                let args=stack.split_off(stack.len()-count);
+                stack.push(format!("{function}({})",args.join(", ")));
+            },
+            0x0119=>{
+                // PbdViewer ResetAssign: pop RHS, duplicate l-value under
+                // RHS. Thus the subsequent add retains the old local value.
+                let rhs=pop(&mut stack)?;
+                let lvalue=stack.last().cloned()
+                    .ok_or_else(||format!("ResetAssign has no target at 0x{offset:04X}"))?;
+                stack.push(lvalue);
+                stack.push(rhs);
+            },
+            0x0080|0x0082|0x0088=>{
+                if i+1!=instructions.len() {
+                    return Err(format!("intermediate EndAssign at 0x{offset:04X}"));
+                }
+                let rhs=pop(&mut stack)?;
+                let lvalue=pop(&mut stack)?;
+                if lvalue!=name || !stack.is_empty() {
+                    return Err(format!("unresolved assignment stack at 0x{offset:04X}"));
+                }
+                stack.push(format!("{lvalue} = {rhs}"));
+                ended=true;
+            },
+            _=>return Err(format!("unsupported opcode 0x{:04X} at 0x{offset:04X}",
+                ins.opcode)),
+        }
+        if stack.len()>64 || stack.iter().any(|value|value.len()>16384) {
+            return Err("symbolic expression size limit reached".into());
+        }
+    }
+    if !ended || stack.len()!=1 {
+        return Err("assignment ended without verified EndAssign".into());
+    }
+    Ok(stack.pop().unwrap_or_default())
+}
+
 fn recognized_literal_append(
     segment:&[&FlowInsn],sym:&FunctionSymbols,show_sensitive:bool,
 ) -> Option<(usize,Option<String>)> {
@@ -2499,6 +2628,12 @@ fn print_post_connect_sql_trace(
                         println!("    Candidate assignment 0x{:04X}..0x{:04X}",
                             begin.position,block[end_idx].position);
                         let complete_assignment=&block[begin_idx..=end_idx];
+                        match sql_assignment_expression(
+                            complete_assignment,sym,system_catalog,show_sensitive
+                        ) {
+                            Ok(expression)=>println!("      Symbolic assignment: {expression}"),
+                            Err(reason)=>println!("      Symbolic assignment unresolved: {reason}"),
+                        }
                         // A direct source read and ResetAssign are stronger
                         // provenance evidence than a literal keyword alone.
                         // This does not model indirect aliases or called code.
@@ -3341,6 +3476,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+    #[test]
+    fn sql_symbolic_assignment_shows_order_of_set_and_previous_value() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol {
+                name:"ls_pom".into(),global_index:None,type_id:0x0006,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let opcodes=[
+            0x011d,0x003b,0x001e,0x007d,0x0034,0x01bc,
+            0x01bd,0x007d,0x0088,
+        ];
+        let mut instructions=Vec::new();
+        for (idx,opcode) in opcodes.into_iter().enumerate() {
+            let operands=match opcode {
+                0x01bc=>vec![0x53,0x01,0xd0,0x40],
+                0x01bd=>vec![0,0,1,0],
+                _=>vec![0,0,0,0],
+            };
+            instructions.push(FlowInsn {
+                position:idx*6,end:(idx+1)*6,opcode,operands,
+            });
+        }
+        let refs=instructions.iter().collect::<Vec<_>>();
+        let formula=sql_assignment_expression(&refs,&sym,None,false).unwrap();
+        assert_eq!(formula,
+            "ls_pom = ((<string@0x0006> + ls_pom) + system_function_339(<number@0x0018>))");
+        assert!(!formula.contains("Password"));
+        instructions[7].opcode=0x020f;
+        let broken=instructions.iter().collect::<Vec<_>>();
+        assert!(sql_assignment_expression(&broken,&sym,None,false).is_err());
+    }
+
+    #[test]
+    fn sql_symbolic_reset_assign_preserves_prior_value() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol {
+                name:"ls_pom".into(),global_index:None,type_id:0x0006,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let opcodes=[0x011d,0x003b,0x003b,0x007d,
+                     0x0128,0x0119,0x007d,0x012a,0x0088];
+        let instructions=opcodes.into_iter().enumerate()
+            .map(|(idx,opcode)|FlowInsn {
+                position:idx*6,end:(idx+1)*6,
+                opcode,operands:vec![0,0,0,0],
+            }).collect::<Vec<_>>();
+        let refs=instructions.iter().collect::<Vec<_>>();
+        assert_eq!(
+            sql_assignment_expression(&refs,&sym,None,false).unwrap(),
+            "ls_pom = (ls_pom + (<string@0x0006> + <string@0x000C>))");
+    }
+
 
     #[test]
     fn reset_assign_literal_append_is_not_mistaken_for_replacement() {
