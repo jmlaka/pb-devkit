@@ -3187,6 +3187,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+    #[test]
+    fn explicit_sensitive_literal_mode_is_opt_in() {
+        let mut stack=vec![0u8;16];
+        let secret="s3cr3t-user:Password=abc";
+        for c in secret.encode_utf16().chain(std::iter::once(0)) {
+            stack.extend_from_slice(&c.to_le_bytes());
+        }
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:stack,locals:Vec::new(),
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let inst=FlowInsn {position:0,end:6,opcode:0x003b,
+            operands:(16u32).to_le_bytes().to_vec()};
+        assert!(!redacted_gate_instruction(&sym,&inst,false).contains("s3cr3t"));
+        assert!(redacted_gate_instruction(&sym,&inst,true).contains(secret));
+        let integer=FlowInsn {position:6,end:12,opcode:0x0034,
+            operands:12345i32.to_le_bytes().to_vec()};
+        assert!(!redacted_gate_instruction(&sym,&integer,false).contains("12345"));
+        assert!(redacted_gate_instruction(&sym,&integer,true).contains("12345"));
+    }
+
 
     #[test]
     fn sql_literal_classifier_only_reports_whitelisted_categories() {
