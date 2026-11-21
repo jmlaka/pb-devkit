@@ -47,3 +47,26 @@ connections, or transformations of credentials occur. If the system group's
 layout differs, the parser reports an error instead of inventing names.
 
 Reference implementation: \`pb-devkit-2.x/pb-devkit-cli/examples/probe_pcode.rs\`.
+
+
+## Diagnose CONNECT route predicates without exposing literals
+
+The DB connection function has three alternative first connection sites:
+0x01D6, 0x03FE and 0x04F4. Their selectors are conditional jumps at
+0x009C and 0x02D8. The ordinary flow renderer can fail to reconstruct a
+predicate when a basic block contains an unsupported instruction.
+
+Use the fully redacted metadata trace to identify the missing opcode and
+the types of anonymous local variables:
+
+```bash
+cargo test -p pb-devkit-cli --example probe_pcode
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --connect-gate-trace f_connect.fun 0
+```
+
+The output never prints string literals, numeric literal values, connection
+parameters, raw instruction operands or database credentials. It prints
+instruction offsets and types, opcode names, validated symbol names, and
+branch destination offsets only. Unknown operations remain labeled as such;
+they are not assumed to have any particular stack effect.
