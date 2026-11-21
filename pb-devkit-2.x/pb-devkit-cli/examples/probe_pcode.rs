@@ -3985,6 +3985,75 @@ fn print_heslo_initializers(
     Ok(())
 }
 
+// Trace the compiled origin of f_connect's ls_pom template without
+// decoding its contents. This is a structural read of PB333 declarations
+// and P-code; no DB connection, credential calculation, or output values.
+fn print_connect_template_origin(
+    sym:&FunctionSymbols,
+    lines:&[FlowInsn],
+    declarations:&[[u8;20]],
+    value_pool:&[u8],
+    signature:&Pb333FormalSignature,
+    catalog:&[SystemCatalogObject],
+) {
+    println!("=== F_CONNECT DBPARM TEMPLATE ORIGIN (REDACTED) ===");
+    println!("No template literals, initializer bytes, lengths or hashes printed.");
+    let selected=sym.locals.iter().enumerate()
+        .filter(|(_,var)|var.name.eq_ignore_ascii_case("ls_pom"))
+        .map(|(i,_)|i).collect::<Vec<_>>();
+    if selected.len()!=1 {
+        println!("ls_pom symbol not uniquely identified; cannot determine origin.");
+        return;
+    }
+    let idx=selected[0];
+    let Some(record)=declarations.get(idx) else {
+        println!("ls_pom declaration record missing; cannot determine origin.");
+        return;
+    };
+    let Some(variable)=sym.locals.get(idx) else{return;};
+    let declaration_type=u16::from_le_bytes([record[18],record[19]]);
+    if declaration_type!=0x0006 || variable.type_id!=0x0006 {
+        println!("ls_pom is not a catalog-consistent string; interpretation refused.");
+        return;
+    }
+    println!("Template variable: local[{idx}] ls_pom (string)");
+    let category=pb333_string_initializer_category(record,value_pool);
+    println!("Declaration-time value: {category}");
+    println!("Declaration flags: custom-initializer={}, indirect={}, shared={}, array={}",
+        record[17]&1!=0, record[0]&2!=0,record[17]&2!=0,
+        record[17]&32!=0);
+    let is_formal=signature.params.iter().any(|(name,_)|
+        name.eq_ignore_ascii_case("ls_pom"));
+    println!("Formal function parameter: {}",if is_formal {"yes"} else {"no"});
+    let assignments=lines.iter().filter(|ins|
+        matches!(ins.opcode,0x011d|0x0120) &&
+        flow_operand_word(&ins.operands,0)==idx
+    ).map(|ins|ins.position).collect::<Vec<_>>();
+    println!("Recognized local-assignment starts: {}",assignments.len());
+    for pos in assignments.iter().take(16) {
+        println!("  BeginAssign local ls_pom at 0x{pos:04X}");
+    }
+    if assignments.len()>16 {println!("  Further assignment sites omitted.");}
+    let accesses=lines.iter().filter(|ins|
+        matches!(ins.opcode,0x001e|0x0030|0x01a9|0x0150) &&
+        flow_operand_word(&ins.operands,0)==idx
+    ).count();
+    println!("Recognized direct reads: {accesses}");
+    let sites=dbparm_completed_assignments(lines,sym,catalog);
+    println!("Catalog-verified DBParm assignment candidates: {}",sites.len());
+    for (connect,begin,end) in sites {
+        let region=&lines[begin..=end];
+        let uses_template=region.iter().any(|ins|
+            matches!(ins.opcode,0x001e|0x0030|0x01a9|0x0150) &&
+            flow_operand_word(&ins.operands,0)==idx);
+        let prior_writes=assignments.iter().filter(|pos|
+            **pos<lines[begin].position).count();
+        println!("  CONNECT 0x{connect:04X}: ls_pom directly read by DBParm expression={uses_template}; recognized earlier local writes={prior_writes}");
+    }
+    println!("Caution: does not exclude aliasing, by-reference modification,");
+    println!("or unrecognized indirect writes; not a runtime-value evaluation.");
+}
+
 fn pb333_formal_signature(
     data:&[u8],selected:usize,
 )->Result<Pb333FormalSignature,String> {
@@ -4169,6 +4238,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.len()!=1 {return Err("usage: probe_pcode --transaction-catalog".into());}
         let parser=PblParser::new(EXE)?;
         return transaction_catalog_scan(&parser);
+    }
+    if args.first().map(|arg|arg=="--connect-template-origin").unwrap_or(false) {
+        if args.len()!=4 {
+            return Err("usage: probe_pcode --connect-template-origin f_connect.fun <body_index> <catalog.grp>".into());
+        }
+        let body=args[2].parse::<usize>()?;
+        let parser=PblParser::new(EXE)?;
+        let entry=parser.entries().iter()
+            .find(|e|e.name.eq_ignore_ascii_case(&args[1]))
+            .ok_or_else(||format!("compiled entry not found: {}",args[1]))?;
+        let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+        let symbols=find_pcode_symbols(&data,body)?;
+        let lines=flow_instructions(&symbols.code)?;
+        let (declarations,value_pool)=pb333_body_local_declarations(&data,body)?;
+        let signature=pb333_formal_signature(&data,body)?;
+        let catalog=parse_system_objects(&std::fs::read(&args[3])?)?;
+        print_connect_template_origin(
+            &symbols,&lines,&declarations,&value_pool,&signature,&catalog);
+        return Ok(());
     }
     if args.first().map(|arg|arg=="--heslo-initializers").unwrap_or(false) {
         if args.len()!=3 {
@@ -4582,6 +4670,38 @@ mod semantic_probe_tests {
         let mut unknown=lines.clone();
         unknown[5].opcode=0x020f;
         assert!(redacted_dbparm_expression(&unknown,&sym).is_err());
+    }
+
+    #[test]
+    fn connect_template_origin_reports_no_initializer_contents() {
+        let mut pool=vec![0u8;16];
+        for unit in "sensitive-fixture".encode_utf16().chain(std::iter::once(0)) {
+            pool.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut record=[0u8;20];
+        record[17]=1;
+        record[12..16].copy_from_slice(&16u32.to_le_bytes());
+        record[18..20].copy_from_slice(&6u16.to_le_bytes());
+        let sym=FunctionSymbols{
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol{
+                name:"ls_pom".into(),global_index:None,type_id:6
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let signature=Pb333FormalSignature {
+            name:"f_connect".into(),params:Vec::new(),return_type:6,
+        };
+        let lines=vec![FlowInsn{
+            position:0,end:4,opcode:0x001e,operands:vec![0,0]
+        }];
+        // Verify the category classifier in this exact declaration shape.
+        assert_eq!(pb333_string_initializer_category(&record,&pool),
+            "compiled nonempty-string initializer");
+        assert!(sym.locals[0].name=="ls_pom");
+        assert_eq!(lines[0].opcode,0x001e);
+        assert!(signature.params.is_empty());
     }
 
     #[test]
