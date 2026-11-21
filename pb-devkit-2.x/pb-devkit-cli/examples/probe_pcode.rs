@@ -2024,12 +2024,50 @@ fn reachable_return_indices(lines:&[FlowInsn]) -> Vec<usize> {
     result
 }
 
+// Resolve a narrow, exact sequence: typed transaction local -> indexed
+// member -> member read -> optional stack-neutral casts -> RETURN(value).
+// Unlike a proximity-based heuristic, this supports only a verified
+// five-instruction expression and never accesses the field's runtime value.
+fn direct_transaction_field_return(
+    lines:&[FlowInsn],idx:usize,sym:&FunctionSymbols,
+    catalog:Option<&[SystemCatalogObject]>
+) -> Option<String> {
+    let catalog=catalog?;
+    let ret=lines.get(idx)?;
+    if ret.opcode!=0x0001 || flow_operand_word(&ret.operands,0)!=1 {
+        return None;
+    }
+    let mut before=idx.checked_sub(1)?;
+    while matches!(lines.get(before)?.opcode,
+        0x003f|0x008e|0x0139|0x0123..=0x012b|0x012d..=0x013e)
+    {
+        before=before.checked_sub(1)?;
+    }
+    let read=lines.get(before)?;
+    if read.opcode!=0x0027{return None;}
+    let field=lines.get(before.checked_sub(1)?)?;
+    let object=lines.get(before.checked_sub(2)?)?;
+    let property=catalog_transaction_property(sym,object,field,catalog)?;
+    // Verify instruction order is truly contiguous.
+    if object.end!=field.position || field.end!=read.position {return None;}
+    let local_idx=flow_operand_word(&object.operands,0);
+    let name=sym.locals.get(local_idx)?.name.as_str();
+    if name.is_empty() || !name.chars().all(|c|c.is_ascii_alphanumeric()||c=='_'){
+        return None;
+    }
+    Some(format!("RETURN {name}.{property} (system catalog verified)"))
+}
+
 // Only the conventional status literals -1/0/1 are displayed. If the return
 // expression is not a single, immediately preceding literal/push, don't guess
 // it: PB's expression stack can be populated across earlier instructions.
 fn safe_immediate_return_hint(
-    lines:&[FlowInsn],idx:usize,sym:&FunctionSymbols
+    lines:&[FlowInsn],idx:usize,sym:&FunctionSymbols,
+    catalog:Option<&[SystemCatalogObject]>
 ) -> String {
+    if let Some(value)=direct_transaction_field_return(lines,idx,sym,catalog) {
+        return value;
+    }
     let Some(ins)=lines.get(idx) else {return "unresolved return".into();};
     if ins.opcode==0x0000 ||
         (ins.opcode==0x0001 && flow_operand_word(&ins.operands,0)==0) {
@@ -2147,7 +2185,8 @@ fn print_transaction_assignment_paths(
     println!("Caveat: object initialization and indirect runtime changes not analyzed.");
 }
 
-fn print_connect_return_map(lines:&[FlowInsn], sym:&FunctionSymbols) {
+fn print_connect_return_map(lines:&[FlowInsn], sym:&FunctionSymbols,
+    catalog:Option<&[SystemCatalogObject]>) {
     println!("\n=== CONNECT RETURN CONTRACT (REDACTED STATIC TRACE) ===");
     println!("Reachable RETURN sites, nearby opcodes and conservative payload hints.");
     println!("No raw operands, passwords, DBParm text, string literals or arbitrary numbers.");
@@ -2156,7 +2195,7 @@ fn print_connect_return_map(lines:&[FlowInsn], sym:&FunctionSymbols) {
     for index in reachable {
         let ins=&lines[index];
         println!("\nRETURN at 0x{:04X}: {}",ins.position,
-            safe_immediate_return_hint(lines,index,sym));
+            safe_immediate_return_hint(lines,index,sym,catalog));
         let start=gate_trace_block_start(lines,ins.position)
             .unwrap_or(ins.position);
         let block:Vec<&FlowInsn>=lines.iter()
@@ -2308,7 +2347,7 @@ fn inspect_connection_sites(
     println!("For exact data-flow, follow the property-assignment stack backwards.");
     print_connection_control_flow(&lines,&symbols,system_catalog,&connect_indices);
     print_preconnect_routing(&lines,&symbols);
-    print_connect_return_map(&lines,&symbols);
+    print_connect_return_map(&lines,&symbols,system_catalog);
     print_transaction_assignment_paths(&lines,&symbols,system_catalog);
     Ok(())
 }
@@ -2880,6 +2919,65 @@ mod semantic_probe_tests {
     use super::*;
 
     #[test]
+    fn type_verified_transaction_sqlcode_return_has_no_secret_data() {
+        let mut blob=vec![0u8;20];
+        blob[8..12].copy_from_slice(&0xffffu32.to_le_bytes());
+        blob[12..14].copy_from_slice(&9u16.to_le_bytes());
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:blob,
+            locals:vec![VariableSymbol {
+                name:"at_sql".into(),global_index:None,type_id:0x8000,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:vec!["transaction".into()],
+        };
+        let objects=vec![SystemCatalogObject {
+            name:"transaction".into(),type_id:0x4084,parent_type:0xffff,
+            all_member_count:17,
+            instance_fields:(0..17).map(|i|
+                if i==9 {"sqlcode".into()} else {format!("member{i}")}).collect(),
+            function_definitions:Vec::new(),
+        }];
+        let lines=vec![
+            FlowInsn {position:0x2aa,end:0x2ae,opcode:0x0030,operands:vec![0,0]},
+            FlowInsn {position:0x2ae,end:0x2b4,opcode:0x0020,operands:vec![8,0,0,0]},
+            FlowInsn {position:0x2b4,end:0x2b8,opcode:0x0027,operands:vec![0,0]},
+            FlowInsn {position:0x2b8,end:0x2bc,opcode:0x008e,operands:vec![0,0]},
+            FlowInsn {position:0x2bc,end:0x2c0,opcode:0x0001,operands:vec![1,0]},
+        ];
+        assert_eq!(
+            safe_immediate_return_hint(&lines,4,&sym,Some(&objects)),
+            "RETURN at_sql.sqlcode (system catalog verified)");
+        assert!(safe_immediate_return_hint(&lines,4,&sym,None)
+            .contains("source not proven"));
+    }
+
+    #[test]
+    fn transaction_return_requires_type_matched_field_descriptor() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:vec![0u8;16],
+            locals:vec![VariableSymbol {
+                name:"at_sql".into(),global_index:None,type_id:0x0006,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let objects=vec![SystemCatalogObject {
+            name:"transaction".into(),type_id:0x4084,parent_type:0xffff,
+            all_member_count:17,instance_fields:vec!["x".into();17],
+            function_definitions:Vec::new(),
+        }];
+        let lines=vec![
+            FlowInsn {position:0,end:4,opcode:0x0030,operands:vec![0,0]},
+            FlowInsn {position:4,end:10,opcode:0x0020,operands:vec![8,0,0,0]},
+            FlowInsn {position:10,end:14,opcode:0x0027,operands:vec![0,0]},
+            FlowInsn {position:14,end:18,opcode:0x0001,operands:vec![1,0]},
+        ];
+        assert_eq!(direct_transaction_field_return(&lines,3,&sym,Some(&objects)),None);
+    }
+
+
+    #[test]
     fn path_sensitive_transaction_assignment_does_not_inherit_skipped_branch() {
         let mut buffer=vec![0u8;18];
         buffer[8..12].copy_from_slice(&0xffffu32.to_le_bytes());
@@ -2937,7 +3035,7 @@ mod semantic_probe_tests {
                 FlowInsn {position:6,end:10,opcode:0x0001,
                     operands:vec![1,0]},
             ];
-            assert_eq!(safe_immediate_return_hint(&lines,1,&sym),hint);
+            assert_eq!(safe_immediate_return_hint(&lines,1,&sym,None),hint);
         }
     }
 
