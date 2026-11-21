@@ -1619,6 +1619,9 @@ fn print_connection_input_origins(
             .find(|v|v.name.eq_ignore_ascii_case(target));
         if let Some((idx,var))=local {
             println!("Variable {target}: local[{idx}], type 0x{:04X}",var.type_id);
+            if let Some(global_slot)=var.global_index {
+                println!("  Declaration is a reference to global slot {global_slot}, not an independent local value.");
+            }
             if var.type_id==0x0006 {
                 match records.get(idx) {
                     Some(rec)=>println!("  Declaration: {}",
@@ -2714,6 +2717,19 @@ fn sql_assignment_expression_with_prior(
                     .map(|v|gate_symbol_name(&v.name).to_string())
                     .unwrap_or_else(||format!("<local#{pos}>")));
                 stack.push(value);
+            },
+            0x002f|0x011f|0x0153|0x0154|0x0174|0x01a6|0x0201=>{
+                // These PB333 opcodes are PushGlobalVariable variants,
+                // not assignments. Resolve the reference through the
+                // local/global symbol tables without exposing its contents.
+                let name=flow_global(sym,&ins.operands);
+                if name.starts_with("<invalid-") ||
+                    name.starts_with("global[") {
+                    return Err(format!(
+                        "global variable reference unresolved at 0x{offset:04X}"
+                    ));
+                }
+                stack.push(gate_symbol_name(&name).to_string());
             },
             0x003b=>{
                 let value=if show_sensitive {
@@ -5282,6 +5298,44 @@ mod semantic_probe_tests {
         let args=call_argument_stack_sources(&seq,6,&sym,6,4).unwrap();
         assert_eq!(args[0],"<empty string literal>");
         assert_eq!(args[3],"g_connect_name");
+    }
+
+    #[test]
+    fn local_assignment_expression_resolves_global_push_and_name() {
+        let sym=FunctionSymbols{
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![
+                VariableSymbol {
+                    name:"ls_connection_name".to_string(),
+                    type_id:6,global_index:None,
+                },
+                VariableSymbol {
+                    name:"gs_ini_subor".to_string(),
+                    type_id:6,global_index:Some(23),
+                },
+            ],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let make=|position:usize,opcode:u16,operands:Vec<u8>|FlowInsn{
+            position,end:position+2+operands.len(),opcode,operands
+        };
+        let lines=vec![
+            make(0,0x011d,vec![0,0]),
+            make(4,0x002f,vec![23,0]),
+            make(8,0x0129,vec![0,0]),
+            make(12,0x0088,Vec::new()),
+        ];
+        let refs=lines.iter().collect::<Vec<_>>();
+        assert_eq!(
+            sql_assignment_expression(&refs,&sym,None,false).unwrap(),
+            "ls_connection_name = gs_ini_subor"
+        );
+        let mut unknown=lines.clone();
+        unknown[1].operands=vec![24,0];
+        assert!(sql_assignment_expression(
+            &unknown.iter().collect::<Vec<_>>(),&sym,None,false
+        ).is_err());
     }
 
     #[test]
