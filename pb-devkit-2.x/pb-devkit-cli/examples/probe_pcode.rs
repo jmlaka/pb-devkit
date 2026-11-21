@@ -1762,6 +1762,127 @@ fn redacted_entry_gate_predicate(
     condition
 }
 
+// A strictly redacted, instruction-level diagnostic for unresolved login
+// routing conditions. Unlike --strings or raw disassembly, this deliberately
+// NEVER emits literal text, literal numbers, stack-buffer bytes, or unknown
+// instruction operand data. It is safe to share as a metadata report.
+fn gate_symbol_name(name:&str) -> &str {
+    if name.len()<=64 && !name.is_empty() &&
+        name.chars().all(|c|c.is_ascii_alphanumeric() || c=='_')
+    {name} else {"<unnamed>"}
+}
+
+fn redacted_gate_instruction(sym:&FunctionSymbols, ins:&FlowInsn) -> String {
+    let op=ins.opcode;
+    match op {
+        0x001e|0x0030|0x014f|0x0150|0x0172|0x01a9|0x0200|
+        0x011d|0x0120 => {
+            let idx=flow_operand_word(&ins.operands,0);
+            match sym.locals.get(idx) {
+                Some(v)=>format!("local[{idx}] {} : {}",
+                    gate_symbol_name(&v.name),
+                    describe_type_id(v.type_id,&sym.type_names)),
+                None=>format!("local[{idx}] <unresolved>"),
+            }
+        },
+        0x002f|0x011f|0x0153|0x0154|0x0174|0x01a6|0x0201=>{
+            let index=flow_operand_word(&ins.operands,0) as u16;
+            let var=sym.locals.iter().chain(sym.globals.iter())
+                .find(|v|v.global_index==Some(index));
+            match var {
+                Some(v)=>format!("global[{index}] {} : {}",
+                    gate_symbol_name(&v.name),
+                    describe_type_id(v.type_id,&sym.type_names)),
+                None=>format!("global[{index}] <unresolved>"),
+            }
+        },
+        0x0032..=0x003c | 0x01ff =>
+            "literal <redacted> (content and numeric value suppressed)".into(),
+        0x0002|0x0003|0x0004=>{
+            let dest=flow_operand_word(&ins.operands,0);
+            let form=if op==0x0002 {"if true"}
+                else if op==0x0003 {"if false"}
+                else {"unconditional"};
+            format!("jump {form} -> 0x{dest:04X}"),
+        },
+        0x01bc=>{
+            let index=flow_operand_word(&ins.operands,0);
+            let object_id=flow_operand_word(&ins.operands,2);
+            if object_id&0x8000!=0 {
+                let name=sym.referenced_functions.get(index)
+                    .map(|value|gate_symbol_name(value)).unwrap_or("<unresolved>");
+                format!("referenced function {name} (ref #{index})")
+            } else {
+                format!("system/object function 0x{object_id:04X}:#{index}")
+            }
+        },
+        0x0020|0x01d2=>field_descriptor_metadata(sym,&ins.operands),
+        _=>format!("{}",opcode_action(op)),
+    }
+}
+
+fn gate_trace_block_start(lines:&[FlowInsn], branch_position:usize)
+    -> Option<usize>
+{
+    let mut candidates=vec![0usize];
+    for ins in lines {
+        if matches!(ins.opcode,0x0002|0x0003|0x0004) {
+            candidates.push(flow_operand_word(&ins.operands,0));
+        }
+        if matches!(ins.opcode,0x0000..=0x0004) {
+            candidates.push(ins.end);
+        }
+    }
+    candidates.into_iter()
+        .filter(|&offset|offset<=branch_position)
+        .max()
+}
+
+fn print_redacted_gate_trace(lines:&[FlowInsn],sym:&FunctionSymbols) {
+    println!("=== CONNECT GATE INSTRUCTION DIAGNOSTICS (REDACTED) ===");
+    println!("No source literals or raw operands. Type IDs, named symbols, opcodes and offsets only.");
+    for (gate, limit) in [(0x009cusize,80usize),(0x02d8usize,50usize)] {
+        println!("\nGate at 0x{gate:04X}:");
+        let Some(begin)=gate_trace_block_start(lines,gate) else {
+            println!("  Cannot determine basic block boundary.");
+            continue;
+        };
+        let block:Vec<&FlowInsn>=lines.iter()
+            .filter(|ins|ins.position>=begin && ins.position<=gate).collect();
+        let omitted=block.len().saturating_sub(limit);
+        println!("  Basic block: 0x{begin:04X}..0x{gate:04X} | instructions {}",
+            block.len());
+        if omitted>0 {
+            println!("  First {omitted} instruction(s) omitted from this view.");
+        }
+        for ins in block.iter().skip(omitted) {
+            println!("  0x{:04X}  0x{:04X} {:<27} {}",
+                ins.position,ins.opcode,opcode_action(ins.opcode),
+                redacted_gate_instruction(sym,ins));
+        }
+        // Print only unnamed locals referenced by this basic block:
+        // identifies variable#9's declared type without its runtime value.
+        let mut anonymous=std::collections::BTreeSet::new();
+        for ins in &block {
+            if matches!(ins.opcode,0x001e|0x0030|0x014f|0x0150|
+                0x0172|0x01a9|0x0200|0x011d|0x0120) {
+                let idx=flow_operand_word(&ins.operands,0);
+                if let Some(var)=sym.locals.get(idx) {
+                    if var.name.starts_with("<variable#") {
+                        anonymous.insert(idx);
+                    }
+                }
+            }
+        }
+        for index in anonymous {
+            if let Some(var)=sym.locals.get(index) {
+                println!("  Unnamed local #{index}: {}",
+                    describe_type_id(var.type_id,&sym.type_names));
+            }
+        }
+    }
+}
+
 fn print_preconnect_routing(lines:&[FlowInsn], sym:&FunctionSymbols) {
     println!("\n=== CONNECT ENTRY ROUTING (STATIC, REDACTED) ===");
     println!("Explores both outcomes of unknown conditions; stops at first CONNECT or RETURN.");
@@ -2384,6 +2505,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let parser=PblParser::new(EXE)?;
         return transaction_catalog_scan(&parser);
     }
+    if args.first().map(|arg|arg=="--connect-gate-trace").unwrap_or(false) {
+        if args.len()!=3 {
+            return Err("usage: probe_pcode --connect-gate-trace <object.fun> <body_index>".into());
+        }
+        let body_index=args[2].parse::<usize>()?;
+        let parser=PblParser::new(EXE)?;
+        let entry=parser.entries().iter()
+            .find(|e|e.name.eq_ignore_ascii_case(&args[1]))
+            .ok_or_else(||format!("compiled entry not found: {}",args[1]))?;
+        let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+        let symbols=find_pcode_symbols(&data,body_index)?;
+        let lines=flow_instructions(&symbols.code)?;
+        print_redacted_gate_trace(&lines,&symbols);
+        return Ok(());
+    }
     if args.first().map(|arg|arg=="--connect-map").unwrap_or(false) {
         if args.len()<2 || args.len()>4 {
             return Err("usage: probe_pcode --connect-map <object.fun> [body_index] [catalog.grp]".into());
@@ -2511,6 +2647,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+    #[test]
+    fn gate_diagnostics_suppress_literal_bytes_and_numeric_values() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol {
+                name:"<variable#9>".into(),global_index:None,type_id:0x0006,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let numeric=FlowInsn {position:0,end:6,opcode:0x0034,
+            operands:vec![0x39,0x30,0,0]};
+        let literal=redacted_gate_instruction(&sym,&numeric);
+        assert!(literal.contains("<redacted>"));
+        assert!(!literal.contains("12345"));
+        let unnamed=FlowInsn {position:6,end:10,opcode:0x0030,
+            operands:vec![0x00,0x00]};
+        let description=redacted_gate_instruction(&sym,&unnamed);
+        assert!(description.contains("local[0]"));
+        assert!(!description.contains("<variable#9>"));
+        assert!(description.contains("primitive type"));
+    }
+
+    #[test]
+    fn gate_trace_start_uses_jump_target_not_arbitrary_window() {
+        let lines=vec![
+            FlowInsn {position:0,end:4,opcode:0x0003,operands:vec![20,0]},
+            FlowInsn {position:4,end:10,opcode:0x003b,operands:vec![0,0,0,0]},
+            FlowInsn {position:20,end:24,opcode:0x0030,operands:vec![0,0]},
+            FlowInsn {position:24,end:28,opcode:0x0003,operands:vec![40,0]},
+        ];
+        assert_eq!(gate_trace_block_start(&lines,24),Some(20));
+    }
+
     #[test]
     fn entry_gate_condition_is_redacted_and_preserves_variable_identity() {
         let sym=FunctionSymbols {
