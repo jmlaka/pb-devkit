@@ -814,9 +814,15 @@ fn annotated_opcode(
                     Some(name) => format!("function reference [{idx}]: {name}"),
                     None => format!("unresolved function reference [{idx}]")
                 }
-            } else { format!("system/object function reference [{idx}]") }
+            } else if object_id & 0x4000 != 0 {
+                format!("system function reference: object=0x{object_id:04X}, index={idx} (name requires system catalog)")
+            } else {
+                format!("object function reference: object=0x{object_id:04X}, index={idx}")
+            }
         },
         0x0010 | 0x000f => sql_info(symbols,operands,show_strings),
+        0x0123..=0x012b | 0x012d..=0x013e =>
+            "stack-neutral cast (PbdViewer verified)".into(),
         0x0195 => "isnull(value)".into(),
         0x00a8 => "comparison: =".into(),
         0x0025 => "logical OR".into(),
@@ -992,7 +998,11 @@ fn flow_statement(
             stack.push(format!("({a} OR {b})"));
             None
         }
-        0x003f | 0x008e | 0x0133 | 0x013b | 0x0139 | 0x0129 | 0x012a => None, // cast = no-op per PbdViewer
+        // PB333 0x0123..=0x012B map to PCodeParser90 cases 288..296:
+        // Cast(0). 0x012D..=0x013E map to cases 298..315: Cast(type).
+        // Both are stack-neutral (PCodeParserBase.Cast does nothing).
+        // 0x012C maps to case 297, which has no confirmed handling.
+        0x003f | 0x008e | 0x0139 | 0x0123..=0x012b | 0x012d..=0x013e => None,
         0x0080 | 0x0082 | 0x0088 => {
             let value=flow_pop(stack);
             let variable=flow_pop(stack);
@@ -1064,7 +1074,13 @@ fn flow_statement(
             let name=if object_id & 0x8000 != 0 {
                 sym.referenced_functions.get(function_index).cloned()
             } else { None };
-            stack.push(name.unwrap_or_else(||format!("<global-function-ref#{function_index}>")));
+            stack.push(match name {
+                Some(name) => name,
+                None if object_id & 0x4000 != 0 => format!(
+                    "<system-function object=0x{object_id:04X} index={function_index}>"
+                ),
+                None => format!("<unresolved-global-function index={function_index}>"),
+            });
             None
         }
         0x01bd => {
@@ -1164,7 +1180,7 @@ fn print_flow(sym: &FunctionSymbols, reveal_strings: bool)
     println!("\n=== CONSERVATIVE CONTROL-FLOW OUTLINE ===");
     println!("Blocks: {} | reachable: {} | unreachable: {}",
         blocks.len(), reachable.len(), blocks.len()-reachable.len());
-    println!("Warning: per-block stack is reset; SQL text and function references are unresolved.");
+    println!("Warning: per-block stack is reset; system function names need an external catalog.");
     for (start,end) in blocks {
         let annotation=if reachable.contains(&start) {""} else {" [UNREACHABLE]"};
         println!("\nL{start:04X}:{annotation}  // 0x{start:04X}..0x{end:04X}");
@@ -2098,6 +2114,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn pb333_casts_do_not_clear_expression_stack() {
+        let symbols = FunctionSymbols {
+            code: Vec::new(), stack_buffer: Vec::new(),
+            locals: Vec::new(), globals: Vec::new(),
+            referenced_functions: Vec::new(), sql_pool: Vec::new(),
+            type_names: Vec::new(),
+        };
+        let mut stack=vec!["as_pouzivatel".to_string()];
+        for &opcode in &[0x0128u16,0x012bu16,0x012au16,0x0133u16] {
+            let operands=vec![0u8; OPERAND_WORDS[opcode as usize] as usize*2];
+            let ins=FlowInsn {position:0,end:2+operands.len(),opcode,operands};
+            assert_eq!(flow_statement(&ins,&symbols,&mut stack,false),None);
+            assert_eq!(stack,vec!["as_pouzivatel".to_string()]);
+        }
+    }
+
+    #[test]
+    fn system_function_reference_retains_object_and_index_not_fake_name() {
+        let symbols = FunctionSymbols {
+            code: Vec::new(), stack_buffer: Vec::new(),
+            locals: Vec::new(), globals: Vec::new(),
+            referenced_functions: Vec::new(), sql_pool: Vec::new(),
+            type_names: Vec::new(),
+        };
+        let ins=FlowInsn {
+            position:0,end:6,opcode:0x01bc,
+            operands:vec![0x53,0x01,0x01,0x40],
+        };
+        let mut stack=Vec::new();
+        assert_eq!(flow_statement(&ins,&symbols,&mut stack,false),None);
+        assert_eq!(stack,vec!["<system-function object=0x4001 index=339>".to_string()]);
+    }
+
 
 
     #[test]
