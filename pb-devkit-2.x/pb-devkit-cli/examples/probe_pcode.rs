@@ -1803,7 +1803,7 @@ fn redacted_gate_instruction(sym:&FunctionSymbols, ins:&FlowInsn) -> String {
             let form=if op==0x0002 {"if true"}
                 else if op==0x0003 {"if false"}
                 else {"unconditional"};
-            format!("jump {form} -> 0x{dest:04X}"),
+            format!("jump {form} -> 0x{dest:04X}")
         },
         0x01bc=>{
             let index=flow_operand_word(&ins.operands,0);
