@@ -2897,6 +2897,111 @@ fn dbparm_completed_assignments(
     found
 }
 
+// Exact PB333 f_heslo body-0 pattern. Reject unknown branch, copy, or
+// comparison semantics rather than classifying a username by proximity.
+// The reconstructed strings are used only in private in-memory equality
+// comparisons. No string fragments, lengths, hashes, or numeric values
+// are ever printed.
+fn pb333_heslo_username_branch_strings(
+    lines:&[FlowInsn],sym:&FunctionSymbols,
+)->Option<[String;2]> {
+    let instruction=|position:usize|->Option<&FlowInsn> {
+        lines.iter().find(|ins|ins.position==position)
+    };
+    let check=|position:usize,opcode:u16|->Option<&FlowInsn> {
+        let ins=instruction(position)?;
+        (ins.opcode==opcode).then_some(ins)
+    };
+    check(0x0000,0x011d).filter(|ins|flow_operand_word(&ins.operands,0)==7)?;
+    check(0x0004,0x001e).filter(|ins|flow_operand_word(&ins.operands,0)==0)?;
+    check(0x0008,0x0139)?;
+    check(0x000c,0x0088)?;
+    let mut conditions=Vec::<String>::new();
+    for (a,b,add,cast,local,compare,branch,target) in [
+        (0x0010,0x0016,0x001c,0x001e,0x0020,0x0024,0x002a,0x0044),
+        (0x0044,0x004a,0x0050,0x0052,0x0054,0x0058,0x005e,0x0086),
+    ] {
+        let left=check(a,0x003b)?;
+        let right=check(b,0x003b)?;
+        check(add,0x007d)?;
+        check(cast,0x0128)?;
+        check(local,0x001e)
+            .filter(|ins|flow_operand_word(&ins.operands,0)==7)?;
+        check(compare,0x00ad)?;
+        check(branch,0x0003)
+            .filter(|ins|flow_operand_word(&ins.operands,0)==target)?;
+        let decode=|ins:&FlowInsn|->Option<String> {
+            let raw=ins.operands.get(..4)?;
+            let ptr=u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+            utf16_string(&sym.stack_buffer,ptr)
+        };
+        conditions.push(format!("{}{}",decode(left)?,decode(right)?));
+    }
+    Some([conditions.remove(0),conditions.remove(0)])
+}
+
+fn pb333_select_heslo_username_branch(
+    username:&str,conditions:&[String;2],
+) -> &'static str {
+    if username==conditions[0] {
+        "first username condition"
+    } else if username==conditions[1] {
+        "second username condition"
+    } else {
+        "default branch"
+    }
+}
+
+fn print_username_branch_map(
+    connect_lines:&[FlowInsn],connect_sym:&FunctionSymbols,
+    catalog:&[SystemCatalogObject],
+    heslo_lines:&[FlowInsn],heslo_sym:&FunctionSymbols,
+    heslo_signature:&Pb333FormalSignature,
+) {
+    println!("=== F_HESLO USERNAME BRANCH MAP (REDACTED, STATIC) ===");
+    println!("Literal username values, lengths and hashes are never printed.");
+    println!("Branch is determined by comparing compiled literal argument #1 against");
+    println!("the exact two compiled f_heslo branch strings; no functions executed.");
+    let valid_signature=heslo_signature.name.eq_ignore_ascii_case("f_heslo") &&
+        heslo_signature.params.len()==2 &&
+        heslo_signature.params[0].0.eq_ignore_ascii_case("as_pouzivatel") &&
+        heslo_signature.params[1].0.eq_ignore_ascii_case("as_dbms");
+    if !valid_signature {
+        println!("Formal signature mismatch: branch classification refused.");
+        return;
+    }
+    let Some(conditions)=pb333_heslo_username_branch_strings(
+        heslo_lines,heslo_sym
+    ) else {
+        println!("f_heslo condition pattern not recognized: classification refused.");
+        return;
+    };
+    let assignments=dbparm_completed_assignments(
+        connect_lines,connect_sym,catalog);
+    if assignments.is_empty() {
+        println!("No catalog-verified completed DBParm assignments identified.");
+        return;
+    }
+    for (connect,begin,end) in assignments {
+        let region=&connect_lines[begin..=end];
+        let branch=dbparm_heslo_literal_argument_slots(region,connect_sym)
+            .and_then(|(slot,_)|region.iter()
+                .filter(|ins|ins.opcode==0x003b)
+                .nth(slot.saturating_sub(1)))
+            .and_then(|ins|{
+                let raw=ins.operands.get(..4)?;
+                let ptr=u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+                utf16_string(&connect_sym.stack_buffer,ptr)
+            })
+            .map(|username|pb333_select_heslo_username_branch(
+                &username,&conditions));
+        println!("  CONNECT 0x{connect:04X}: {}",
+            branch.unwrap_or("unresolved"));
+    }
+    println!("This establishes the chosen branch only; it does not evaluate");
+    println!("f_heslo's output or establish the final DBParm value.");
+}
+
 // Only report equality of compiled constants between catalog-verified
 // DBParm assignment candidates. No literal text, length, digest, value,
 // address, or runtime credential is ever emitted.
@@ -3941,6 +4046,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_post_connect_sql_trace(&lines,&symbols,show_sensitive,catalog.as_deref());
         return Ok(());
     }
+    if args.first().map(|arg|arg=="--username-branch-map").unwrap_or(false) {
+        if args.len()!=6 {
+            return Err("usage: probe_pcode --username-branch-map <connect.fun> <body_index> <f_heslo.fun> <body_index> <catalog.grp>".into());
+        }
+        let connect_body=args[2].parse::<usize>()?;
+        let heslo_body=args[4].parse::<usize>()?;
+        let parser=PblParser::new(EXE)?;
+        let load=|entry_name:&str|->Result<Vec<u8>,Box<dyn std::error::Error>> {
+            let entry=parser.entries().iter()
+                .find(|e|e.name.eq_ignore_ascii_case(entry_name))
+                .ok_or_else(||format!("compiled entry not found: {entry_name}"))?;
+            Ok(parser.parse_chunk_chain(entry.data_offset,entry.size)?)
+        };
+        let connect_data=load(&args[1])?;
+        let heslo_data=load(&args[3])?;
+        let connect_sym=find_pcode_symbols(&connect_data,connect_body)?;
+        let heslo_sym=find_pcode_symbols(&heslo_data,heslo_body)?;
+        let connect_lines=flow_instructions(&connect_sym.code)?;
+        let heslo_lines=flow_instructions(&heslo_sym.code)?;
+        let signature=pb333_formal_signature(&heslo_data,heslo_body)?;
+        let catalog=parse_system_objects(&std::fs::read(&args[5])?)?;
+        print_username_branch_map(
+            &connect_lines,&connect_sym,&catalog,
+            &heslo_lines,&heslo_sym,&signature);
+        return Ok(());
+    }
     if args.first().map(|arg|arg=="--dbparm-call-context").unwrap_or(false) {
         if args.len()!=4 {
             return Err("usage: probe_pcode --dbparm-call-context <object.fun> <body_index> <catalog.grp>".into());
@@ -4161,6 +4292,56 @@ mod semantic_probe_tests {
         record[30]=0;
         assert!(pb333_signature_from_record(
             &record,&function_buffer,&params).unwrap().params.is_empty());
+    }
+
+    #[test]
+    fn f_heslo_username_conditions_require_exact_verified_comparison_pattern() {
+        let mut pool=vec![0u8;16];
+        let mut offs=Vec::new();
+        for value in ["AB","X","Y"] {
+            offs.push(pool.len() as u32);
+            for unit in value.encode_utf16().chain(std::iter::once(0)) {
+                pool.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:pool,locals:Vec::new(),
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mut instructions=vec![
+            (0x0000,0x011d,vec![7,0]),
+            (0x0004,0x001e,vec![0,0]),
+            (0x0008,0x0139,vec![1,0]),
+            (0x000c,0x0088,vec![0,0]),
+        ];
+        for (a,b,add,cast,local,compare,branch,target,other) in [
+            (0x0010,0x0016,0x001c,0x001e,0x0020,0x0024,0x002a,0x0044,offs[1]),
+            (0x0044,0x004a,0x0050,0x0052,0x0054,0x0058,0x005e,0x0086,offs[2]),
+        ] {
+            instructions.extend([
+                (a,0x003b,offs[0].to_le_bytes().to_vec()),
+                (b,0x003b,other.to_le_bytes().to_vec()),
+                (add,0x007d,Vec::new()),
+                (cast,0x0128,Vec::new()),
+                (local,0x001e,vec![7,0]),
+                (compare,0x00ad,vec![0,0,0,0]),
+                (branch,0x0003,(target as u16).to_le_bytes().to_vec()),
+            ]);
+        }
+        let mut lines=instructions.into_iter().map(|(pos,opcode,operands)|
+            FlowInsn{position:pos,end:pos+2+operands.len(),opcode,operands}
+        ).collect::<Vec<_>>();
+        let conditions=pb333_heslo_username_branch_strings(&lines,&sym).unwrap();
+        assert_eq!(conditions,["ABX".to_string(),"ABY".to_string()]);
+        assert_eq!(pb333_select_heslo_username_branch("ABX",&conditions),
+            "first username condition");
+        assert_eq!(pb333_select_heslo_username_branch("ABY",&conditions),
+            "second username condition");
+        assert_eq!(pb333_select_heslo_username_branch("ZZZ",&conditions),
+            "default branch");
+        lines.iter_mut().find(|v|v.position==0x005e).unwrap().opcode=0x0002;
+        assert!(pb333_heslo_username_branch_strings(&lines,&sym).is_none());
     }
 
     #[test]
