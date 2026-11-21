@@ -1587,6 +1587,94 @@ fn call_argument_stack_sources(
     Ok(stack)
 }
 
+// Examine the variables feeding f_connect at a specific direct callsite.
+// Only metadata and redacted formula fragments are emitted. A linear
+// assignment list is not equivalent to branch-sensitive dataflow.
+fn print_connection_input_origins(
+    lines:&[FlowInsn],sym:&FunctionSymbols,
+    records:&[[u8;20]],value_pool:&[u8],call_offset:usize,
+) {
+    println!("=== CONNECTION CALLSITE INPUT ORIGINS (STATIC, REDACTED) ===");
+    println!("No literal contents, connection strings or runtime values printed.");
+    let Some(call_idx)=lines.iter().position(|ins|ins.position==call_offset &&
+        ins.opcode==0x01bc &&
+        referenced_function_at(sym,ins).is_some_and(|name|
+            compiled_function_name_matches(&name,"f_connect")))
+    else {
+        println!("Requested call offset is not a verified f_connect function push.");
+        return;
+    };
+    let call=&lines[call_idx];
+    let call_end=lines.get(call_idx+1);
+    if !call_end.is_some_and(|ins|ins.opcode==0x01bd &&
+        flow_operand_word(&ins.operands,2)==6) {
+        println!("Following function call does not have verified six-arg signature.");
+        return;
+    }
+    println!("f_connect call at 0x{:04X}, six arguments verified.",call.position);
+    for target in ["ls_connection_name","gs_ini_subor"] {
+        let local=sym.locals.iter().enumerate()
+            .find(|(_,v)|v.name.eq_ignore_ascii_case(target));
+        let global=sym.globals.iter()
+            .find(|v|v.name.eq_ignore_ascii_case(target));
+        if let Some((idx,var))=local {
+            println!("Variable {target}: local[{idx}], type 0x{:04X}",var.type_id);
+            if var.type_id==0x0006 {
+                match records.get(idx) {
+                    Some(rec)=>println!("  Declaration: {}",
+                        pb333_string_initializer_category(rec,value_pool)),
+                    None=>println!("  Declaration metadata unavailable"),
+                }
+            }
+            let assignments=lines.iter().filter(|ins|
+                ins.position<call_offset &&
+                matches!(ins.opcode,0x011d|0x0120) &&
+                flow_operand_word(&ins.operands,0)==idx
+            ).collect::<Vec<_>>();
+            println!("  Recognized preceding BeginAssign sites: {}",assignments.len());
+            for ins in assignments.iter().rev().take(12).rev() {
+                match local_assignment_at(lines,ins.position,idx) {
+                    Ok(slice)=>{
+                        let refs=slice.iter().collect::<Vec<_>>();
+                        match sql_assignment_expression(&refs,sym,None,false) {
+                            Ok(formula) if formula.len()<2000=>
+                                println!("  0x{:04X}..0x{:04X} {}",ins.position,
+                                    slice.last().map(|v|v.position).unwrap_or(ins.position),
+                                    formula),
+                            Ok(_)=>println!("  0x{:04X}: formula too long (redacted)",ins.position),
+                            Err(reason)=>println!("  0x{:04X}: expression unresolved: {reason}",ins.position),
+                        }
+                    },
+                    Err(reason)=>println!("  0x{:04X}: assignment boundary unresolved: {reason}",ins.position),
+                }
+            }
+            if assignments.len()>12 {
+                println!("  Earlier assignment sites omitted (only last 12 shown).");
+            }
+        } else if let Some(var)=global {
+            println!("Variable {target}: global, type 0x{:04X}",var.type_id);
+            let Some(index)=var.global_index else {
+                println!("  Global slot index unavailable.");
+                continue;
+            };
+            let refs=lines.iter().filter(|ins|
+                ins.position<call_offset &&
+                matches!(ins.opcode,0x002f|0x011f|0x0153|0x0154|0x0174|0x01a6|0x0201) &&
+                flow_operand_word(&ins.operands,0)==usize::from(index)
+            ).collect::<Vec<_>>();
+            println!("  References before call: {}",refs.len());
+            for ins in refs.iter().rev().take(16).rev() {
+                println!("  0x{:04X}: opcode 0x{:04X} ({})",
+                    ins.position,ins.opcode,opcode_action(ins.opcode));
+            }
+            println!("  Global assignment origin may be in another function/body.");
+        } else {
+            println!("Variable {target}: not present in this body's resolved symbols.");
+        }
+    }
+    println!("Assignment ordering is lexical, not proof of runtime reachability.");
+}
+
 fn scan_compiled_function_callers(
     parser:&PblParser, target:&str, show_argument_sources:bool,
 ) -> Result<(),Box<dyn std::error::Error>> {
@@ -4771,6 +4859,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let parser=PblParser::new(EXE)?;
         return inspect_connection_sites(&parser,&args[1],index,catalog.as_deref(),show_sensitive);
     }
+    if args.first().map(|arg|arg=="--callsite-input-origins").unwrap_or(false) {
+        if args.len()!=4 {
+            return Err("usage: probe_pcode --callsite-input-origins <object.win> <body_index> <call_offset_hex>".into());
+        }
+        let body=args[2].parse::<usize>()?;
+        let offset_text=args[3].strip_prefix("0x")
+            .or_else(||args[3].strip_prefix("0X"))
+            .unwrap_or(&args[3]);
+        let offset=usize::from_str_radix(offset_text,16)?;
+        let parser=PblParser::new(EXE)?;
+        let entry=parser.entries().iter()
+            .find(|e|e.name.eq_ignore_ascii_case(&args[1]))
+            .ok_or_else(||format!("compiled entry not found: {}",args[1]))?;
+        let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+        let sym=find_pcode_symbols(&data,body)?;
+        let lines=flow_instructions(&sym.code)?;
+        let (locals,pool)=pb333_body_local_declarations(&data,body)?;
+        print_connection_input_origins(&lines,&sym,&locals,&pool,offset);
+        return Ok(());
+    }
     if args.first().map(|arg|arg=="--caller-args").unwrap_or(false) {
         if args.len()!=2 {
             return Err("usage: probe_pcode --caller-args <function_name>".into());
@@ -5174,6 +5282,35 @@ mod semantic_probe_tests {
         let args=call_argument_stack_sources(&seq,6,&sym,6,4).unwrap();
         assert_eq!(args[0],"<empty string literal>");
         assert_eq!(args[3],"g_connect_name");
+    }
+
+    #[test]
+    fn caller_origin_reference_lookup_uses_name_and_location() {
+        let sym=FunctionSymbols{
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol{
+                name:"ls_connection_name".into(),type_id:6,global_index:None,
+            }],
+            globals:vec![VariableSymbol{
+                name:"gs_ini_subor".into(),type_id:6,global_index:Some(27),
+            }],
+            referenced_functions:vec!["f_connect".into()],
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let make=|position,opcode,operands:Vec<u8>|FlowInsn{
+            position,end:position+2+operands.len(),opcode,operands
+        };
+        let lines=vec![
+            make(0x100,0x011d,vec![0,0]),
+            make(0x104,0x003b,vec![0;4]),
+            make(0x10a,0x0088,vec![]),
+            make(0x110,0x01a6,vec![27,0]),
+            make(0x114,0x01bc,vec![0,0,1,0x80]),
+            make(0x11a,0x01bd,vec![0,0,6,0,0,0]),
+        ];
+        assert_eq!(flow_global(&sym,&lines[3].operands),"gs_ini_subor");
+        assert_eq!(local_assignment_at(&lines,0x100,0).unwrap().len(),3);
+        assert_eq!(referenced_function_at(&sym,&lines[4]).as_deref(),Some("f_connect"));
     }
 
     #[test]
