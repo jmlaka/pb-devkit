@@ -2344,6 +2344,16 @@ fn sql_assignment_expression(
     instructions:&[&FlowInsn],sym:&FunctionSymbols,
     catalog:Option<&[SystemCatalogObject]>,show_sensitive:bool,
 ) -> Result<String,String> {
+    sql_assignment_expression_with_prior(
+        instructions,sym,catalog,show_sensitive,None
+    )
+}
+
+fn sql_assignment_expression_with_prior(
+    instructions:&[&FlowInsn],sym:&FunctionSymbols,
+    catalog:Option<&[SystemCatalogObject]>,show_sensitive:bool,
+    prior_rhs:Option<&str>,
+) -> Result<String,String> {
     let first=instructions.first().ok_or("empty assignment")?;
     if !matches!(first.opcode,0x011d|0x0120) {
         return Err("first opcode is not BeginAssignLocalVariable".into());
@@ -2361,9 +2371,11 @@ fn sql_assignment_expression(
         match ins.opcode {
             0x001e|0x0030|0x01a9|0x0150=>{
                 let pos=flow_operand_word(&ins.operands,0);
-                let value=sym.locals.get(pos)
+                let value=if pos==index {
+                    prior_rhs.map(|rhs|format!("({rhs})"))
+                } else {None}.unwrap_or_else(||sym.locals.get(pos)
                     .map(|v|gate_symbol_name(&v.name).to_string())
-                    .unwrap_or_else(||format!("<local#{pos}>"));
+                    .unwrap_or_else(||format!("<local#{pos}>")));
                 stack.push(value);
             },
             0x003b=>{
@@ -2437,7 +2449,8 @@ fn sql_assignment_expression(
                 let rhs=pop(&mut stack)?;
                 let lvalue=stack.last().cloned()
                     .ok_or_else(||format!("ResetAssign has no target at 0x{offset:04X}"))?;
-                stack.push(lvalue);
+                stack.push(prior_rhs.map(|value|format!("({value})"))
+                    .unwrap_or(lvalue));
                 stack.push(rhs);
             },
             0x0080|0x0082|0x0088=>{
@@ -2463,6 +2476,53 @@ fn sql_assignment_expression(
         return Err("assignment ended without verified EndAssign".into());
     }
     Ok(stack.pop().unwrap_or_default())
+}
+
+// Compose only successfully decoded writes to the same SQL source in the
+// current basic block. Redaction is forced even in a sensitive local run.
+// Refuse composition if the initial write depends on an unknown prior value.
+fn composed_sql_source_assignments(
+    block:&[&FlowInsn],source_idx:usize,sym:&FunctionSymbols,
+    catalog:Option<&[SystemCatalogObject]>,
+) -> Result<(usize,String),String> {
+    let name=sym.locals.get(source_idx)
+        .map(|v|gate_symbol_name(&v.name))
+        .ok_or("SQL source local missing")?;
+    let mut rhs:Option<String>=None;
+    let mut count=0usize;
+    let mut last_end:Option<usize>=None;
+    for (i,ins) in block.iter().enumerate() {
+        if !matches!(ins.opcode,0x011d|0x0120) ||
+            flow_operand_word(&ins.operands,0)!=source_idx {continue;}
+        if last_end.is_some_and(|end|i<=end) {
+            return Err("overlapping SQL source assignments".into());
+        }
+        let end=((i+1)..block.len()).find(|&j|matches!(block[j].opcode,
+            0x007f..=0x008c|0x0104..=0x0118|0x0159|0x0205|0x0207..=0x0209))
+            .ok_or_else(||format!("missing EndAssign at 0x{:04X}",ins.position))?;
+        let segment=&block[i..=end];
+        if rhs.is_none() && segment.iter().skip(1).any(|ins|
+            (matches!(ins.opcode,0x001e|0x0030|0x01a9|0x0150) &&
+             flow_operand_word(&ins.operands,0)==source_idx) ||
+            ins.opcode==0x0119
+        ) {
+            return Err("initial assignment reads unknown previous value".into());
+        }
+        let formula=sql_assignment_expression_with_prior(
+            segment,sym,catalog,false,rhs.as_deref()
+        )?;
+        let prefix=format!("{name} = ");
+        let next=formula.strip_prefix(&prefix)
+            .ok_or("assignment expression has unexpected destination")?;
+        if next.len()>16384 {
+            return Err("composed expression size limit reached".into());
+        }
+        rhs=Some(next.to_string());
+        count+=1;
+        last_end=Some(end);
+    }
+    rhs.map(|value|(count,format!("{name} = {value}")))
+        .ok_or_else(||"no SQL source assignments in block".into())
 }
 
 fn recognized_literal_append(
@@ -2616,6 +2676,14 @@ fn print_post_connect_sql_trace(
                 }
             }
             println!("  BeginAssign sites for SQL source in this block: {}",begun.len());
+            match composed_sql_source_assignments(&block,source_idx,sym,system_catalog) {
+                Ok((count,formula))=>{
+                    println!("  Composed SQL source ({count} assignment(s), redacted, current block only):");
+                    println!("    {formula}");
+                    println!("    Symbolic source expression only; runtime SQL is not verified.");
+                },
+                Err(reason)=>println!("  Composed SQL source unavailable: {reason}"),
+            }
             for begin_idx in begun {
                 let begin=block[begin_idx];
                 // First EndAssign follows the BeginAssign; this is a
@@ -3476,6 +3544,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+    #[test]
+    fn sql_composition_carries_prior_literal_through_reset_assign() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol {
+                name:"ls_pom".into(),global_index:None,type_id:0x0006,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        // First assignment initializes the buffer. Second appends two
+        // hidden strings via ResetAssign, preserving the first value.
+        let codes=[
+            0x011d,0x003b,0x0088,
+            0x011d,0x003b,0x003b,0x007d,0x0128,
+            0x0119,0x007d,0x012a,0x0088,
+        ];
+        let lines=codes.into_iter().enumerate().map(|(idx,opcode)|FlowInsn {
+            position:idx*6,end:(idx+1)*6,opcode,
+            operands:vec![0,0,0,0],
+        }).collect::<Vec<_>>();
+        let refs=lines.iter().collect::<Vec<_>>();
+        let (count,formula)=composed_sql_source_assignments(
+            &refs,0,&sym,None
+        ).unwrap();
+        assert_eq!(count,2);
+        assert!(formula.contains("<string@0x0006>"));
+        assert!(formula.contains("<string@0x0018>"));
+        assert!(formula.contains("<string@0x001E>"));
+        assert!(!formula.split_once(" = ").unwrap().1.contains("ls_pom"));
+    }
+
+    #[test]
+    fn sql_composition_refuses_unknown_initial_local_value() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol {
+                name:"ls_pom".into(),global_index:None,type_id:0x0006,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let codes=[0x011d,0x001e,0x0088];
+        let lines=codes.into_iter().enumerate().map(|(idx,opcode)|FlowInsn {
+            position:idx*6,end:(idx+1)*6,opcode,
+            operands:vec![0,0,0,0],
+        }).collect::<Vec<_>>();
+        let refs=lines.iter().collect::<Vec<_>>();
+        assert!(composed_sql_source_assignments(&refs,0,&sym,None).is_err());
+    }
+
     #[test]
     fn sql_symbolic_assignment_shows_order_of_set_and_previous_value() {
         let sym=FunctionSymbols {
