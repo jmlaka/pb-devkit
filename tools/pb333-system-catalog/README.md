@@ -70,3 +70,32 @@ parameters, raw instruction operands or database credentials. It prints
 instruction offsets and types, opcode names, validated symbol names, and
 branch destination offsets only. Unknown operations remain labeled as such;
 they are not assumed to have any particular stack effect.
+
+
+## Verify the connection function's return contract
+
+The three failed paths in \`f_connect.fun\` return transaction member \`#9\`,
+while the common completion path executes a dynamic SQL statement and then
+returns a literal \`0\`. Do not assume that member \`#9\` is \`SQLCode\`
+until checked against the external catalog.
+
+```bash
+cargo test -p pb-devkit-cli --example probe_pcode
+
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --system-metadata /tmp/pb333_typedef.grp
+
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --connect-map f_connect.fun 0 /tmp/pb333_typedef.grp \
+  | sed -n '/=== CONNECT RETURN CONTRACT/,$p'
+```
+
+This displays only catalog-backed names (such as \`at_sql.sqlcode\` if
+the catalog confirms the mapping), control-flow evidence and a short
+whitelisted status-literal description. It does not read SQL strings or
+credentials.
+
+**Caution:** \`SqlExecuteImmediate\` is a real DB operation if the application
+itself is executed. This tool is static and does not execute it. A successful
+connection does not establish that the subsequent dynamic statement is
+read-only or that its result is checked before the \`0\` return.
