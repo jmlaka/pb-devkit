@@ -977,6 +977,21 @@ fn flow_statement(
             stack.push(format!("Upper({value})"));
             None
         }
+        // PB333 0x0199 -> PB105 410 -> PB100 409 -> PB90 407.
+        // PCodeParser90 defines case 407 as Len(value).
+        0x0199 => {
+            let value=flow_pop(stack);
+            stack.push(format!("Len({value})"));
+            None
+        }
+        // PB333 0x005C -> PB105 92 -> PB100 91 -> PB90 89,
+        // defined as a binary subtraction.
+        0x005c => {
+            let rhs=flow_pop(stack);
+            let lhs=flow_pop(stack);
+            stack.push(format!("({lhs} - {rhs})"));
+            None
+        }
         0x0195 => {
             let x = flow_pop(stack);
             stack.push(format!("IsNull({x})"));
@@ -1894,6 +1909,8 @@ fn redacted_gate_instruction(sym:&FunctionSymbols, ins:&FlowInsn,
         },
         0x0020|0x01d2=>field_descriptor_metadata(sym,&ins.operands),
         0x01a4=>"builtin Upper(value)".into(),
+        0x0199=>"builtin Len(value)".into(),
+        0x005c=>"binary subtraction (-)".into(),
         _=>format!("{}",opcode_action(op)),
     }
 }
@@ -2756,10 +2773,11 @@ fn report_system_catalog(objects:&[SystemCatalogObject], source:&str) {
         Some(obj)=>{
             println!("\nSystem function owner: {} (0x{:04X}, {} definitions)",
                 obj.name,obj.type_id,obj.function_definitions.len());
-            let idx=339usize;
-            match obj.function_definitions.get(idx) {
-                Some(function)=>println!("  P-code system function 0x40D0:339 = {function}"),
-                None=>println!("  P-code system function index 339 not in this definition table"),
+            for idx in [139usize,339usize] {
+                match obj.function_definitions.get(idx) {
+                    Some(function)=>println!("  P-code system function 0x40D0:{idx} = {function}"),
+                    None=>println!("  P-code system function index {idx} not in this definition table"),
+                }
             }
         },
         None=>println!("\nSystem function class 0x40D0 not identified."),
