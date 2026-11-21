@@ -227,3 +227,35 @@ recognized append includes the concatenated compiled literal suffix,
 escaped as a terminal string. Keep that output local. Neither mode
 executes SQL; the final SQL command still requires verifying the
 earlier assignments, runtime substitution and the final \`Left()\` edit.
+
+
+## Symbolic order of SQL buffer assignments
+
+In \`f_connect.fun\`, the second \`ls_pom\` assignment reads the prior
+value of \`ls_pom\` and contains a compiled literal starting with
+\`SET\`. A direct local read alone cannot establish whether the
+literal precedes or follows the prior buffer. The
+\`--post-connect-sql\` report now includes a **Symbolic assignment**
+line for each compiler-recognized \`BeginAssignLocalVariable …
+EndAssign\` sequence.
+
+The symbolic interpreter supports local reads, compiled string and
+integer literals, concatenation, subtraction, \`Len\`, \`Upper\`,
+\`IsNull\`, global function calls, stack-neutral casts and
+\`ResetAssign\`. It **refuses** unsupported opcodes and unresolved
+stack states. Redacted strings show only instruction offsets, e.g.
+\`<string@0x0540>\`; function names are resolved from the optional
+system catalog where available.
+
+```bash
+cargo test -p pb-devkit-cli --example probe_pcode
+
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --post-connect-sql f_connect.fun 0 /tmp/pb333_typedef.grp
+```
+
+\`--show-sensitive\` may be added for private local review of
+static constants; it is not needed to identify concatenation order.
+Do not paste sensitive terminal output into chats or issues. The
+symbolic output is a per-assignment expression, **not** a verified
+evaluation of the final dynamic SQL.
