@@ -2323,8 +2323,48 @@ fn sql_literal_intent(literal:&str) -> Option<&'static str> {
 // Restrict the scan to the local contiguous block that contains EXECUTE
 // IMMEDIATE. The reified SQL is never printed. Even a recognized prefix is
 // only evidence from a literal, not a proven classification of the final SQL.
+// A precise match for the final ls_pom rewrite observed in PB333 f_connect.
+// This only recognizes the structural expression; it does not evaluate any
+// string or the dynamic database statement. System function names are
+// resolved only from a version-matched system catalog.
+fn final_sql_source_rewrite(
+    block:&[&FlowInsn], sym:&FunctionSymbols,
+    system_catalog:Option<&[SystemCatalogObject]>,
+) -> Option<String> {
+    for window in block.windows(13) {
+        let opcodes=[
+            0x011d,0x001e,0x001e,0x0199,0x0034,0x005c,
+            0x01bc,0x01bd,0x013b,0x003b,0x007d,0x0129,0x0088,
+        ];
+        if window.iter().map(|ins|ins.opcode).ne(opcodes.into_iter()) {
+            continue;
+        }
+        let dest=flow_operand_word(&window[0].operands,0);
+        if flow_operand_word(&window[1].operands,0)!=dest ||
+            flow_operand_word(&window[2].operands,0)!=dest {continue;}
+        let owner=flow_operand_word(&window[6].operands,2);
+        let function_index=flow_operand_word(&window[6].operands,0);
+        if owner!=0x40d0 || function_index!=139 ||
+            flow_operand_word(&window[7].operands,2)!=2 {continue;}
+        let name=sym.locals.get(dest)?.name.as_str();
+        if name.is_empty() || !name.chars().all(|c|
+            c.is_ascii_alphanumeric() || c=='_') {continue;}
+        let function=system_catalog
+            .and_then(|objects|objects.iter().find(|x|x.type_id==0x40d0))
+            .and_then(|obj|obj.function_definitions.get(function_index))
+            .filter(|value|!value.is_empty() &&
+                value.chars().all(|c|c.is_ascii_alphanumeric() || c=='_'))
+            .map(|s|s.as_str()).unwrap_or("system_function_139");
+        return Some(format!(
+            "{name} = {function}({name}, Len({name}) - <integer-hidden>) + <string-hidden>"
+        ));
+    }
+    None
+}
+
 fn print_post_connect_sql_trace(
     lines:&[FlowInsn],sym:&FunctionSymbols,show_sensitive:bool,
+    system_catalog:Option<&[SystemCatalogObject]>,
 ) {
     println!("=== POST-CONNECT DYNAMIC SQL TRACE ({}) ===",
         if show_sensitive {"SENSITIVE LOCAL OUTPUT"} else {"REDACTED"});
@@ -2378,6 +2418,14 @@ fn print_post_connect_sql_trace(
             .collect();
         println!("  Local basic block 0x{start:04X}..0x{:04X}: {} instruction(s)",
             sql.position,block.len());
+        if let Some(rewrite)=final_sql_source_rewrite(&block,sym,system_catalog) {
+            println!("  Verified final local-string rewrite (values redacted):");
+            println!("    {rewrite}");
+            println!("    Only the final transformation is modeled; earlier assignments");
+            println!("    and the final SQL text still require separate analysis.");
+        } else {
+            println!("  No fully verified final-string rewrite pattern identified.");
+        }
 
         // BeginAssignLocalVariable identifies a potential definition site.
         // Only consider completed assignment sequences before the SQL opcode.
@@ -3069,8 +3117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.first().map(|arg|arg=="--post-connect-sql").unwrap_or(false) {
-        if args.len()!=3 {
-            return Err("usage: probe_pcode --post-connect-sql <object.fun> <body_index>".into());
+        if args.len()!=3 && args.len()!=4 {
+            return Err("usage: probe_pcode --post-connect-sql <object.fun> <body_index> [catalog.grp]".into());
         }
         let body_index=args[2].parse::<usize>()?;
         let parser=PblParser::new(EXE)?;
@@ -3080,7 +3128,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
         let symbols=find_pcode_symbols(&data,body_index)?;
         let lines=flow_instructions(&symbols.code)?;
-        print_post_connect_sql_trace(&lines,&symbols,show_sensitive);
+        let catalog=if let Some(path)=args.get(3) {
+            Some(parse_system_objects(&std::fs::read(path)?)?)
+        } else {None};
+        print_post_connect_sql_trace(&lines,&symbols,show_sensitive,catalog.as_deref());
         return Ok(());
     }
     if args.first().map(|arg|arg=="--connect-map").unwrap_or(false) {
@@ -3210,6 +3261,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn final_sql_rewrite_resolves_catalog_function_without_exposing_literals() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol {
+                name:"ls_pom".into(),global_index:None,type_id:0x0006,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let opcodes=[
+            0x011d,0x001e,0x001e,0x0199,0x0034,0x005c,
+            0x01bc,0x01bd,0x013b,0x003b,0x007d,0x0129,0x0088,
+        ];
+        let mut instructions=Vec::new();
+        for (i,opcode) in opcodes.into_iter().enumerate() {
+            let operands=match opcode {
+                0x01bc=>vec![139,0,0xd0,0x40],
+                0x01bd=>vec![0,0,2,0],
+                _=>vec![0,0,0,0],
+            };
+            instructions.push(FlowInsn{
+                position:i*6,end:(i+1)*6,opcode,operands,
+            });
+        }
+        let refs=instructions.iter().collect::<Vec<_>>();
+        let mut functions=vec!["unmapped".to_string();140];
+        functions[139]="Left".into();
+        let objects=vec![SystemCatalogObject {
+            name:"systemfunctions".into(),type_id:0x40d0,parent_type:0xffff,
+            all_member_count:0,instance_fields:Vec::new(),
+            function_definitions:functions,
+        }];
+        assert_eq!(
+            final_sql_source_rewrite(&refs,&sym,Some(&objects)),
+            Some("ls_pom = Left(ls_pom, Len(ls_pom) - <integer-hidden>) + <string-hidden>".into())
+        );
+        let preview=final_sql_source_rewrite(&refs,&sym,None).unwrap();
+        assert!(preview.contains("system_function_139"));
+        assert!(!preview.contains("Left("));
+        instructions[3].opcode=0x0198;
+        let wrong=instructions.iter().collect::<Vec<_>>();
+        assert!(final_sql_source_rewrite(&wrong,&sym,Some(&objects)).is_none());
+    }
+
+    #[test]
+    fn builtin_len_and_subtraction_have_stack_effects() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:Vec::new(),globals:Vec::new(),
+            referenced_functions:Vec::new(),sql_pool:Vec::new(),
+            type_names:Vec::new(),
+        };
+        let mut stack=vec!["ls_pom".into()];
+        let len=FlowInsn {position:0,end:2,opcode:0x0199,operands:vec![]};
+        flow_statement(&len,&sym,&mut stack,false);
+        assert_eq!(stack,vec!["Len(ls_pom)".to_string()]);
+        stack.push("<number-hidden>".into());
+        let subtraction=FlowInsn {position:2,end:4,opcode:0x005c,operands:vec![]};
+        flow_statement(&subtraction,&sym,&mut stack,false);
+        assert_eq!(stack,vec!["(Len(ls_pom) - <number-hidden>)".to_string()]);
+    }
+
     #[test]
     fn explicit_sensitive_literal_mode_is_opt_in() {
         let mut stack=vec![0u8;16];
