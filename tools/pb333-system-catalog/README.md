@@ -128,3 +128,44 @@ For production read-only access, create a separately authorized, minimally
 privileged database user and verify read-only permissions at the database
 server, rather than relying on application-level flags or reverse-engineered
 query text.
+
+
+## Local opt-in: reveal compiled literals with \`--show-sensitive\`
+
+The CLI recognizes the **same** \`--show-sensitive\` option in all modes,
+regardless of where you put it. Without the flag, existing redaction stays
+enabled. With it, diagnostically relevant **statically decoded literals**
+(including strings or integers) are printed to **your local terminal**.
+
+Examples (run from the repository root):
+
+```bash
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --connect-map f_connect.fun 0 /tmp/pb333_typedef.grp --show-sensitive
+
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --connect-gate-trace f_connect.fun 0 --show-sensitive
+
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --post-connect-sql f_connect.fun 0 --show-sensitive
+
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  f_heslo.fun 0 1000 --flow --show-sensitive
+```
+
+For commands that report *only metadata* (such as
+\`--system-metadata\`, \`--transaction-catalog\`, and
+\`--transaction-field-evidence\`), the global flag is accepted but no secret
+data is available to reveal.
+
+**Limits:** This opt-in exposes constants already stored in compiled P-code.
+It does **not** execute functions, calculate dynamic strings, determine
+runtime passwords, connect to a database or promise a reconstructed final
+\`DBParm\`/SQL statement. Unknown literal encodings remain unparsed rather
+than guessed.
+
+**Security:** Sensitive output may contain database credentials or personal
+information. Never paste the unredacted log into chats, tickets, or public
+repositories. For a private local log on Linux, use \`umask 077\` before
+redirecting output and protect/delete that log when finished. The tool does
+not transmit its output.
