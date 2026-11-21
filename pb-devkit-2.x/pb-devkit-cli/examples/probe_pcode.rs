@@ -1996,6 +1996,109 @@ fn print_connection_control_flow(
     }
 }
 
+// Entire-function control-flow reachability, unlike next_connect_endpoints,
+// which stops at the first CONNECT. Unknown branch conditions explore both
+// directions. No database or application code is ever executed.
+fn reachable_return_indices(lines:&[FlowInsn]) -> Vec<usize> {
+    use std::collections::{BTreeMap,BTreeSet};
+    let positions:BTreeMap<usize,usize>=lines.iter().enumerate()
+        .map(|(i,ins)|(ins.position,i)).collect();
+    let mut visited=BTreeSet::<usize>::new();
+    let mut todo=vec![0usize];
+    let mut result=Vec::new();
+    while let Some(pos)=todo.pop() {
+        if !visited.insert(pos) {continue;}
+        let Some(&index)=positions.get(&pos) else {continue;};
+        let ins=&lines[index];
+        match ins.opcode {
+            0x0000|0x0001=>result.push(index),
+            0x0004=>todo.push(flow_operand_word(&ins.operands,0)),
+            0x0002|0x0003=>{
+                todo.push(flow_operand_word(&ins.operands,0));
+                todo.push(ins.end);
+            },
+            _=>todo.push(ins.end),
+        }
+    }
+    result.sort_unstable();
+    result
+}
+
+// Only the conventional status literals -1/0/1 are displayed. If the return
+// expression is not a single, immediately preceding literal/push, don't guess
+// it: PB's expression stack can be populated across earlier instructions.
+fn safe_immediate_return_hint(
+    lines:&[FlowInsn],idx:usize,sym:&FunctionSymbols
+) -> String {
+    let Some(ins)=lines.get(idx) else {return "unresolved return".into();};
+    if ins.opcode==0x0000 ||
+        (ins.opcode==0x0001 && flow_operand_word(&ins.operands,0)==0) {
+        return "RETURN without value".into();
+    }
+    if ins.opcode!=0x0001 || flow_operand_word(&ins.operands,0)!=1 {
+        return "RETURN flag unresolved".into();
+    }
+    let mut previous=idx.checked_sub(1);
+    while let Some(p)=previous {
+        // Only verified stack-neutral cast opcode families.
+        if matches!(lines[p].opcode,
+            0x003f|0x008e|0x0139|0x0123..=0x012b|0x012d..=0x013e) {
+            previous=p.checked_sub(1);
+        } else {break;}
+    }
+    let Some(prev)=previous.and_then(|p|lines.get(p)) else {
+        return "RETURN of stack value; origin unresolved".into();
+    };
+    match prev.opcode {
+        0x0034=>{
+            match operand_i32(&prev.operands) {
+                Some(-1)=>"RETURN; preceding status literal -1".into(),
+                Some(0)=>"RETURN; preceding status literal 0".into(),
+                Some(1)=>"RETURN; preceding status literal 1".into(),
+                _=>"RETURN; preceding numeric literal redacted".into(),
+            }
+        },
+        0x003b=>"RETURN; preceding string literal redacted".into(),
+        0x001e|0x0030|0x01a9|0x0150=>{
+            let index=flow_operand_word(&prev.operands,0);
+            let name=sym.locals.get(index)
+                .map(|v|gate_symbol_name(&v.name))
+                .unwrap_or("<unresolved>");
+            format!("RETURN; immediately preceding local[{index}] {name}")
+        },
+        _=>format!("RETURN of stack value; preceding opcode {} (source not proven)",
+            opcode_action(prev.opcode)),
+    }
+}
+
+fn print_connect_return_map(lines:&[FlowInsn], sym:&FunctionSymbols) {
+    println!("\n=== CONNECT RETURN CONTRACT (REDACTED STATIC TRACE) ===");
+    println!("Reachable RETURN sites, nearby opcodes and conservative payload hints.");
+    println!("No raw operands, passwords, DBParm text, string literals or arbitrary numbers.");
+    let reachable=reachable_return_indices(lines);
+    println!("Reachable RETURN instructions: {}",reachable.len());
+    for index in reachable {
+        let ins=&lines[index];
+        println!("\nRETURN at 0x{:04X}: {}",ins.position,
+            safe_immediate_return_hint(lines,index,sym));
+        let start=gate_trace_block_start(lines,ins.position)
+            .unwrap_or(ins.position);
+        let block:Vec<&FlowInsn>=lines.iter()
+            .filter(|item|item.position>=start && item.position<=ins.position)
+            .collect();
+        let recent=block.len().saturating_sub(12);
+        println!("  Local basic block 0x{start:04X}..0x{:04X}; last {} instruction(s):",
+            ins.position,block.len()-recent);
+        for item in block.iter().skip(recent) {
+            println!("    0x{:04X} 0x{:04X} {:<27} {}",
+                item.position,item.opcode,opcode_action(item.opcode),
+                redacted_gate_instruction(sym,item));
+        }
+    }
+    println!("\nNote: RETURN payload hints inspect preceding opcodes only; they do not");
+    println!("prove semantic success, failure, or the origin of a stack value.");
+}
+
 fn inspect_connection_sites(
     parser: &PblParser, name: &str, body_index: usize,
     system_catalog: Option<&[SystemCatalogObject]>,
@@ -2129,6 +2232,7 @@ fn inspect_connection_sites(
     println!("For exact data-flow, follow the property-assignment stack backwards.");
     print_connection_control_flow(&lines,&symbols,system_catalog,&connect_indices);
     print_preconnect_routing(&lines,&symbols);
+    print_connect_return_map(&lines,&symbols);
     Ok(())
 }
 
@@ -2697,6 +2801,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn return_contract_only_shows_whitelisted_status_literals() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:Vec::new(),globals:Vec::new(),
+            referenced_functions:Vec::new(),sql_pool:Vec::new(),
+            type_names:Vec::new(),
+        };
+        for (value,hint) in [
+            (0,"RETURN; preceding status literal 0"),
+            (1,"RETURN; preceding status literal 1"),
+            (-1,"RETURN; preceding status literal -1"),
+            (12345,"RETURN; preceding numeric literal redacted"),
+        ] {
+            let lines=vec![
+                FlowInsn {position:0,end:6,opcode:0x0034,
+                    operands:value.to_le_bytes().to_vec()},
+                FlowInsn {position:6,end:10,opcode:0x0001,
+                    operands:vec![1,0]},
+            ];
+            assert_eq!(safe_immediate_return_hint(&lines,1,&sym),hint);
+        }
+    }
+
+    #[test]
+    fn return_contract_reachability_rejects_dead_epilogue() {
+        let lines=vec![
+            FlowInsn {position:0,end:4,opcode:0x0003,
+                operands:vec![10,0]},
+            FlowInsn {position:4,end:8,opcode:0x0001,
+                operands:vec![0,0]},
+            FlowInsn {position:8,end:10,opcode:0x0000,
+                operands:vec![]}, // unreachable
+            FlowInsn {position:10,end:14,opcode:0x0001,
+                operands:vec![0,0]},
+        ];
+        assert_eq!(reachable_return_indices(&lines),vec![1,3]);
+    }
+
 
     #[test]
     fn pb333_connection_selector_is_upper_of_as_typ_without_exposing_modes() {
