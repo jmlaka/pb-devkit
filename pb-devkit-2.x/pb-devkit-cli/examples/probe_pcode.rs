@@ -3582,7 +3582,7 @@ fn report_system_catalog(objects:&[SystemCatalogObject], source:&str) {
         Some(obj)=>{
             println!("\nSystem function owner: {} (0x{:04X}, {} definitions)",
                 obj.name,obj.type_id,obj.function_definitions.len());
-            for idx in [139usize,339usize] {
+            for idx in [81usize,139usize,339usize] {
                 match obj.function_definitions.get(idx) {
                     Some(function)=>println!("  P-code system function 0x40D0:{idx} = {function}"),
                     None=>println!("  P-code system function index {idx} not in this definition table"),
