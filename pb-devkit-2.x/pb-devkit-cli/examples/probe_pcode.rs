@@ -2415,7 +2415,7 @@ fn sql_assignment_expression(
                         .map(|v|gate_symbol_name(v).to_string())
                         .unwrap_or_else(||format!("function_ref_{index}"))
                 } else if owner==0x40d0 {
-                    catalog.and_then(|objects|objects.iter().find(|o|o.type_id==owner))
+                    catalog.and_then(|objects|objects.iter().find(|o|usize::from(o.type_id)==owner))
                         .and_then(|obj|obj.function_definitions.get(index))
                         .map(|name|gate_symbol_name(name).to_string())
                         .unwrap_or_else(||format!("system_function_{index}"))
@@ -3784,7 +3784,7 @@ mod semantic_probe_tests {
             type_names:Vec::new(),
         };
         for (value,hint) in [
-            (0,"RETURN; preceding status literal 0"),
+            (0i32,"RETURN; preceding status literal 0"),
             (1,"RETURN; preceding status literal 1"),
             (-1,"RETURN; preceding status literal -1"),
             (12345,"RETURN; preceding numeric literal redacted"),
