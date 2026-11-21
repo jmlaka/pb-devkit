@@ -2917,6 +2917,35 @@ impl RedactedEquality {
     }
 }
 
+// Verify the immediate two stack arguments to f_heslo only when each
+// is a direct string literal followed solely by stack-neutral casts.
+// Return 1-based positions among string literal pushes in the DBParm
+// assignment, never their values, offsets into the literal pool, or hashes.
+fn dbparm_heslo_literal_argument_slots(
+    segment:&[FlowInsn],sym:&FunctionSymbols,
+)->Option<(usize,usize)> {
+    let calls=segment.iter().enumerate().filter(|(i,ins)|
+        ins.opcode==0x01bc &&
+        referenced_function_at(sym,ins).as_deref()==Some("f_heslo") &&
+        segment.get(i+1).is_some_and(|next|
+            next.opcode==0x01bd &&
+            flow_operand_word(&next.operands,2)==2)
+    ).map(|(i,_)|i).collect::<Vec<_>>();
+    if calls.len()!=1 {return None;}
+    let mut pos=calls[0];
+    let mut take_string=||->Option<usize> {
+        while pos>0 && matches!(segment[pos-1].opcode,
+            0x003f|0x008e|0x0139|0x0123..=0x012b|0x012d..=0x013e
+        ) {pos-=1;}
+        if pos==0 || segment[pos-1].opcode!=0x003b {return None;}
+        pos-=1;
+        Some(segment[..=pos].iter().filter(|ins|ins.opcode==0x003b).count())
+    };
+    let second=take_string()?;
+    let first=take_string()?;
+    Some((first,second))
+}
+
 fn dbparm_constant_equality(
     sym:&FunctionSymbols,a:&FlowInsn,b:&FlowInsn,
 ) -> RedactedEquality {
@@ -3062,6 +3091,14 @@ fn print_dbparm_call_context(
         println!("  Local reads (not values): {}",
             if source_locals.is_empty() {"none".into()}
             else {source_locals.into_iter().collect::<Vec<_>>().join(", ")});
+        match dbparm_heslo_literal_argument_slots(region,sym) {
+            Some((first,second))=>println!(
+                "  f_heslo direct argument provenance: arg #1 = string slot {first}, arg #2 = string slot {second} (contents hidden)"
+            ),
+            None=>println!(
+                "  f_heslo direct argument provenance: unresolved; no assumptions made"
+            ),
+        }
         let mut call_count=0usize;
         for call in (begin+1)..end {
             if lines[call].opcode!=0x01bc {continue;}
@@ -3886,6 +3923,32 @@ mod semantic_probe_tests {
         assert_eq!(simple_structured_loop(&blocks,&terminal,blocks[1]),None);
     }
 
+
+    #[test]
+    fn dbparm_heslo_args_only_identified_when_direct_literals_and_casts() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:Vec::new(),globals:Vec::new(),
+            referenced_functions:vec!["f_heslo".into()],
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let ops=[0x003b,0x003b,0x003b,0x003b,
+                 0x003b,0x0133,0x003b,0x0133,0x01bc,0x01bd,0x003b];
+        let mut lines=ops.into_iter().enumerate().map(|(i,opcode)|FlowInsn {
+            position:i*6,end:(i+1)*6,opcode,
+            operands:match opcode {
+                0x01bc=>vec![0,0,1,0x80],
+                0x01bd=>vec![0,0,2,0,0,0],
+                _=>vec![0,0,0,0],
+            },
+        }).collect::<Vec<_>>();
+        assert_eq!(dbparm_heslo_literal_argument_slots(&lines,&sym),Some((5,6)));
+        lines[5].opcode=0x007d; // stack-affecting operation
+        assert_eq!(dbparm_heslo_literal_argument_slots(&lines,&sym),None);
+        lines[5].opcode=0x0133;
+        lines[9].operands[2]=1; // call no longer has two arguments
+        assert_eq!(dbparm_heslo_literal_argument_slots(&lines,&sym),None);
+    }
 
     #[test]
     fn dbparm_literal_equality_compares_decoded_text_not_pointer_or_digest() {
