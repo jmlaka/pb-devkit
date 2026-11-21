@@ -1586,6 +1586,122 @@ fn known_dbparm_keys(sym:&FunctionSymbols, instructions:&[FlowInsn]) -> Vec<&'st
     known.into_iter().collect()
 }
 
+// Determine the immediate SQLCode guard following a PB333 CONNECT.
+// Only exact patterns are accepted: a transaction field compared with integer
+// zero and then a conditional branch. Never infer success/failure from a jump
+// unless the field is confirmed as SQLCode in a version-matched type catalog.
+#[derive(Debug)]
+struct SqlCodeGuard {
+    branch_offset: usize,
+    field_name: String,
+    zero_dest: usize,
+    nonzero_dest: usize,
+}
+
+fn connect_sqlcode_guard(
+    sym:&FunctionSymbols, lines:&[FlowInsn], connect_idx:usize,
+    catalog:Option<&[SystemCatalogObject]>,
+) -> Option<SqlCodeGuard> {
+    let window=lines.get(connect_idx+1..connect_idx+7)?;
+    let [object,field,get_field,zero,compare,branch]=window else {return None;};
+    if !matches!(object.opcode,0x001e|0x0030|0x01a9|0x0150) ||
+        field.opcode!=0x0020 ||
+        !matches!(get_field.opcode,0x0027|0x0122) ||
+        zero.opcode!=0x0034 ||
+        operand_i32(&zero.operands)!=Some(0) ||
+        !matches!(compare.opcode,0x00b8|0x00a8|0x00ad) ||
+        !matches!(branch.opcode,0x0002|0x0003) {return None;}
+    let field_name=catalog.and_then(|objects|
+        catalog_transaction_property(sym,object,field,objects))?;
+    if !field_name.eq_ignore_ascii_case("sqlcode") {return None;}
+    // 0x0002 = branch when true, 0x0003 = branch when false.
+    // 0x00B8 = <>, 0x00A8/0x00AD = =, both against zero.
+    let jump_dest=flow_operand_word(&branch.operands,0);
+    let fallthrough_dest=branch.end;
+    let (true_dest,false_dest)=if branch.opcode==0x0002 {
+        (jump_dest,fallthrough_dest)
+    } else {(fallthrough_dest,jump_dest)};
+    let (nonzero_dest,zero_dest)=if compare.opcode==0x00b8 {
+        (true_dest,false_dest)
+    } else {(false_dest,true_dest)};
+    Some(SqlCodeGuard {
+        branch_offset:branch.position,field_name,
+        zero_dest,nonzero_dest,
+    })
+}
+
+// Conservative static reachability from one point until the NEXT database
+// CONNECT or RETURN. Conditions not modeled are explored in both directions.
+// These endpoints are possible paths, not a claim about runtime execution.
+fn next_connect_endpoints(
+    lines:&[FlowInsn],start:usize,
+) -> Vec<String> {
+    use std::collections::{BTreeMap,BTreeSet};
+    let by_offset:BTreeMap<usize,&FlowInsn>=lines.iter()
+        .map(|instruction|(instruction.position,instruction)).collect();
+    let mut visited=BTreeSet::new();
+    let mut endpoints=BTreeSet::<String>::new();
+    let mut todo=vec![start];
+    while let Some(offset)=todo.pop() {
+        if !visited.insert(offset) {continue;}
+        let Some(ins)=by_offset.get(&offset) else {
+            endpoints.insert(format!("end/unresolved at 0x{offset:04X}"));
+            continue;
+        };
+        match ins.opcode {
+            0x0005=>{
+                endpoints.insert(format!("CONNECT at 0x{:04X}",ins.position));
+            },
+            0x0000|0x0001=>{
+                endpoints.insert(format!("RETURN at 0x{:04X}",ins.position));
+            },
+            0x0004=>{
+                todo.push(flow_operand_word(&ins.operands,0));
+            },
+            0x0002|0x0003=>{
+                todo.push(flow_operand_word(&ins.operands,0));
+                todo.push(ins.end);
+            },
+            _=>todo.push(ins.end),
+        }
+    }
+    endpoints.into_iter().collect()
+}
+
+fn print_connection_control_flow(
+    lines:&[FlowInsn], sym:&FunctionSymbols,
+    catalog:Option<&[SystemCatalogObject]>,
+    connections:&[usize],
+) {
+    println!("\n=== CONNECT SQLCODE OUTCOME GRAPH (STATIC) ===");
+    println!("Only type-verified SQLCode =/<> 0 guards are classified.");
+    println!("Other branch conditions are explored conservatively, not evaluated.");
+    if catalog.is_none() {
+        println!("No system catalog provided; SQLCode guards cannot be type-verified.");
+    }
+    for (n,index) in connections.iter().enumerate() {
+        let connect=&lines[*index];
+        println!("\nCONNECT #{} at 0x{:04X}:",n+1,connect.position);
+        match connect_sqlcode_guard(sym,lines,*index,catalog) {
+            Some(guard)=>{
+                println!("  SQL outcome check at 0x{:04X}: {} compared with 0",
+                    guard.branch_offset,guard.field_name);
+                let ok=next_connect_endpoints(lines,guard.zero_dest);
+                println!("  SQLCode = 0 (success): -> 0x{:04X}; next endpoints: {}",
+                    guard.zero_dest,ok.join(", "));
+                let failure=next_connect_endpoints(lines,guard.nonzero_dest);
+                println!("  SQLCode <> 0 (failure): -> 0x{:04X}; next endpoints: {}",
+                    guard.nonzero_dest,failure.join(", "));
+            },
+            None=>{
+                println!("  Immediate type-verified SQLCode branch not identified.");
+                let next=next_connect_endpoints(lines,connect.end);
+                println!("  Possible following endpoints: {}",next.join(", "));
+            }
+        }
+    }
+}
+
 fn inspect_connection_sites(
     parser: &PblParser, name: &str, body_index: usize,
     system_catalog: Option<&[SystemCatalogObject]>,
@@ -1717,6 +1833,7 @@ fn inspect_connection_sites(
     println!("\nInterpretation: reported functions are nearby dependencies,");
     println!("not necessarily the direct origin of a specific credential value.");
     println!("For exact data-flow, follow the property-assignment stack backwards.");
+    print_connection_control_flow(&lines,&symbols,system_catalog,&connect_indices);
     Ok(())
 }
 
@@ -2270,6 +2387,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn sqlcode_guard_reconstructs_success_and_failure_for_not_equal() {
+        let mut buffer=vec![0u8;16];
+        buffer[8..12].copy_from_slice(&0xffffu32.to_le_bytes());
+        buffer[12..14].copy_from_slice(&2u16.to_le_bytes());
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:buffer,
+            locals:vec![VariableSymbol {
+                name:"at_sql".into(),global_index:None,type_id:0x8000,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:vec!["transaction".into()],
+        };
+        let objects=vec![SystemCatalogObject {
+            name:"transaction".into(),type_id:0x4084,parent_type:0xffff,
+            all_member_count:3,
+            instance_fields:vec!["dbms".into(),"database".into(),"sqlcode".into()],
+            function_definitions:Vec::new(),
+        }];
+        let instructions=vec![
+            FlowInsn {position:0,end:2,opcode:0x0005,operands:vec![]},
+            FlowInsn {position:2,end:6,opcode:0x0030,operands:vec![0,0]},
+            FlowInsn {position:6,end:12,opcode:0x0020,operands:vec![8,0,0,0]},
+            FlowInsn {position:12,end:16,opcode:0x0027,operands:vec![0,0]},
+            FlowInsn {position:16,end:22,opcode:0x0034,operands:vec![0,0,0,0]},
+            FlowInsn {position:22,end:24,opcode:0x00b8,operands:vec![]},
+            FlowInsn {position:24,end:28,opcode:0x0003,operands:vec![40,0]},
+            FlowInsn {position:28,end:30,opcode:0x0005,operands:vec![]},
+            FlowInsn {position:40,end:42,opcode:0x0000,operands:vec![]},
+        ];
+        let guard=connect_sqlcode_guard(&sym,&instructions,0,Some(&objects))
+            .expect("SQLCode conditional recognized");
+        assert_eq!(guard.field_name,"sqlcode");
+        assert_eq!(guard.zero_dest,40);
+        assert_eq!(guard.nonzero_dest,28);
+        assert_eq!(next_connect_endpoints(&instructions,guard.zero_dest),
+            vec!["RETURN at 0x0028".to_string()]);
+        assert_eq!(next_connect_endpoints(&instructions,guard.nonzero_dest),
+            vec!["CONNECT at 0x001C".to_string()]);
+        assert!(connect_sqlcode_guard(&sym,&instructions,0,None).is_none());
+    }
+
+    #[test]
+    fn branch_reachability_reports_both_unknown_outcomes() {
+        let instructions=vec![
+            FlowInsn {position:0,end:4,opcode:0x0003,operands:vec![10,0]},
+            FlowInsn {position:4,end:6,opcode:0x0005,operands:vec![]},
+            FlowInsn {position:10,end:12,opcode:0x0001,operands:vec![0,0]},
+        ];
+        let found=next_connect_endpoints(&instructions,0);
+        assert_eq!(found,vec!["CONNECT at 0x0004".to_string(),
+                               "RETURN at 0x000A".to_string()]);
+    }
+
 
     #[test]
     fn dbparm_key_detector_never_returns_secret_literal() {
