@@ -1003,10 +1003,20 @@ fn flow_statement(
             stack.push(format!("({a} = {b})"));
             None
         }
-        0x007d => {
+        // PB333 0x0055 -> PB105 85 -> PB100 84 -> PB90 82: addition.
+        0x0055 | 0x007d => {
             let b=flow_pop(stack);
             let a=flow_pop(stack);
             stack.push(format!("({a} + {b})"));
+            None
+        }
+        // PB333 0x00C8 -> PB105 200 -> PB100 199 -> PB90 197: >.
+        // PB333 0x00EC -> PB105 236 -> PB100 235 -> PB90 233: <=.
+        0x00c8 | 0x00ec => {
+            let b=flow_pop(stack);
+            let a=flow_pop(stack);
+            stack.push(format!("({a} {} {b})",
+                if op==0x00c8 {">"} else {"<="}));
             None
         }
         0x00b8 => {
@@ -1255,6 +1265,39 @@ fn flow_has_path(
     false
 }
 
+// A deliberately narrow loop recognizer: only straight-line loop bodies
+// with a conditional guard at their header and a single backward GOTO.
+// All non-loop or ambiguous jumps still use the existing refusal path.
+fn simple_structured_loop(
+    blocks:&[StructuredBlock],
+    terminal:&std::collections::BTreeMap<usize,FlowInsn>,
+    backedge:StructuredBlock,
+) -> Option<(usize,usize)> {
+    let jump=terminal.get(&backedge.start)?;
+    if jump.opcode!=0x0004 {return None;}
+    let header_start=flow_operand_word(&jump.operands,0);
+    if header_start>=backedge.start {return None;}
+    let header=blocks.iter().find(|block|block.start==header_start)?;
+    let guard=terminal.get(&header_start)?;
+    if guard.opcode!=0x0003 || header.end>backedge.start ||
+        flow_operand_word(&guard.operands,0)!=backedge.end
+    {return None;}
+    // No branch into, out of, or within the body except its final backedge.
+    // Such cases require a more general CFG structurer.
+    if blocks.iter().filter(|b|b.start>header_start &&
+        b.start<backedge.start).any(|b|matches!(
+            terminal.get(&b.start).map(|ins|ins.opcode),
+            Some(0x0000..=0x0004)
+        ))
+    {return None;}
+    // Require all intermediate blocks to form an uninterrupted fallthrough.
+    let region=blocks.iter().filter(|b|b.start>=header_start &&
+        b.start<=backedge.start).collect::<Vec<_>>();
+    if region.len()<2 || region.windows(2).any(|pair|pair[0].end!=pair[1].start)
+    {return None;}
+    Some((header_start,backedge.end))
+}
+
 fn print_structured(sym: &FunctionSymbols, reveal_strings: bool)
     -> Result<(), String>
 {
@@ -1319,14 +1362,23 @@ fn print_structured(sym: &FunctionSymbols, reveal_strings: bool)
     }
     let active: Vec<_>=blocks.into_iter()
         .filter(|b| reachable.contains(&b.start)).collect();
+    let mut loop_headers=BTreeMap::<usize,(usize,usize)>::new();
+    let mut loop_backedges=BTreeMap::<usize,usize>::new();
     for block in &active {
         let last=terminal.get(&block.start)
             .ok_or("missing block terminator")?;
         if last.opcode==0x0004 {
-            return Err(format!(
-                "reachable unconditional goto at 0x{:04X}; use --flow",
-                last.position
-            ));
+            let Some((header,exit))=simple_structured_loop(&active,&terminal,*block)
+            else {
+                return Err(format!(
+                    "unstructured unconditional goto at 0x{:04X}; use --flow",
+                    last.position
+                ));
+            };
+            if loop_headers.insert(header,(block.start,exit)).is_some() {
+                return Err("multiple backedges per loop not supported; use --flow".into());
+            }
+            loop_backedges.insert(block.start,header);
         }
         if matches!(last.opcode,0x0002|0x0003) {
             let target=flow_operand_word(&last.operands,0);
@@ -1377,6 +1429,14 @@ fn print_structured(sym: &FunctionSymbols, reveal_strings: bool)
                     format!("NOT ({condition})")
                 };
                 let false_target=flow_operand_word(&ins.operands,0);
+                if let Some((_,exit))=loop_headers.get(&block.start) {
+                    if *exit!=false_target {
+                        return Err("loop exit does not match guard; use --flow".into());
+                    }
+                    println!("{}DO WHILE {}", "    ".repeat(indent),positive);
+                    indent+=1;
+                    continue;
+                }
                 let is_join=flow_has_path(&successors,block.end,false_target);
                 // Only one open ELSE branch is supported so far;
                 // this avoids silently emitting misnested scopes.
@@ -1396,8 +1456,12 @@ fn print_structured(sym: &FunctionSymbols, reveal_strings: bool)
                 });
                 indent+=1;
             } else if ins.opcode==0x0004 {
-                // Reachable unconditional jumps were rejected above.
-                return Err("unstructured unconditional jump".into());
+                if loop_backedges.get(&block.start)
+                    !=Some(&flow_operand_word(&ins.operands,0)) {
+                    return Err("unstructured unconditional jump".into());
+                }
+                indent=indent.saturating_sub(1);
+                println!("{}LOOP", "    ".repeat(indent));
             } else if let Some(stmt)=flow_statement(ins,sym,&mut stack,reveal_strings) {
                 println!("{}{}", "    ".repeat(indent),stmt);
             }
@@ -3544,6 +3608,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+    #[test]
+    fn pb333_string_replace_operators_preserve_boolean_and_arithmetic_stack() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:Vec::new(),globals:Vec::new(),
+            referenced_functions:Vec::new(),sql_pool:Vec::new(),
+            type_names:Vec::new(),
+        };
+        for (opcode,expected) in [
+            (0x00ecu16,"(ll_pozicia <= 0)"),
+            (0x00c8u16,"(ll_pozicia > 0)"),
+            (0x0055u16,"(ll_pozicia + ll_dlzka_nove)"),
+        ] {
+            let mut stack=vec!["ll_pozicia".into(),
+                if opcode==0x0055 {"ll_dlzka_nove".into()} else {"0".into()}];
+            let op=FlowInsn {position:0,end:2,opcode,operands:Vec::new()};
+            assert_eq!(flow_statement(&op,&sym,&mut stack,false),None);
+            assert_eq!(stack,vec![expected.to_string()]);
+        }
+    }
+
+    #[test]
+    fn structured_loop_recognizer_accepts_single_guarded_backedge_only() {
+        let blocks=vec![
+            StructuredBlock {start:0x006a,end:0x007a},
+            StructuredBlock {start:0x007a,end:0x00dc},
+            StructuredBlock {start:0x00dc,end:0x00e8},
+        ];
+        let mut terminal=std::collections::BTreeMap::new();
+        terminal.insert(0x006a,FlowInsn {
+            position:0x0076,end:0x007a,opcode:0x0003,
+            operands:vec![0xdc,0x00],
+        });
+        terminal.insert(0x007a,FlowInsn {
+            position:0x00d8,end:0x00dc,opcode:0x0004,
+            operands:vec![0x6a,0x00],
+        });
+        assert_eq!(simple_structured_loop(&blocks,&terminal,blocks[1]),
+            Some((0x006a,0x00dc)));
+        terminal.get_mut(&0x006a).unwrap().operands=vec![0xe8,0x00];
+        assert_eq!(simple_structured_loop(&blocks,&terminal,blocks[1]),None);
+    }
+
     #[test]
     fn sql_composition_carries_prior_literal_through_reset_assign() {
         let sym=FunctionSymbols {
