@@ -1651,6 +1651,9 @@ struct SystemCatalogObject {
     parent_type: u16,
     all_member_count: usize,
     instance_fields: Vec<String>,
+    // FunctionDefinitions array, indexed by the P-code system function index.
+    // Only public names; no body, constants or runtime data.
+    function_definitions: Vec<String>,
 }
 
 fn system_object_fields(r: &mut Cursor<'_>) -> Result<Vec<String>,String> {
@@ -1680,7 +1683,9 @@ fn parse_system_objects(data: &[u8]) -> Result<Vec<SystemCatalogObject>, String>
     r.records20()?;
     let object_count=r.u16()? as usize;
     let extended_count=r.u16()? as usize;
-    r.struct_buffer()?;
+    // The first buffer contains FunctionDefinition names (+0 of each
+    // 48-byte definition); the next stores parameter names.
+    let function_name_pool=pool_buffer(&mut r)?;
     r.struct_buffer()?;
     let type_names=named_types(&mut r)?;
     r.records20()?;
@@ -1717,11 +1722,21 @@ fn parse_system_objects(data: &[u8]) -> Result<Vec<SystemCatalogObject>, String>
                 let all_member_count=word(header,28)?;
                 r.bytes(all_member_count.checked_mul(8).ok_or("invalid all-variable entries")?)?;
                 r.bytes(word(header,26)?.checked_mul(16).ok_or("invalid function references")?)?;
-                r.bytes(word(header,4)?.checked_mul(48).ok_or("invalid definitions")?)?;
+                let definition_bytes=r.bytes(word(header,4)?
+                    .checked_mul(48).ok_or("invalid definitions")?)?;
+                let function_definitions=definition_bytes.chunks_exact(48).enumerate()
+                    .map(|(index,def)| {
+                        let name_offset=u32::from_le_bytes([def[0],def[1],def[2],def[3]]);
+                        utf16_string(&function_name_pool,name_offset)
+                            .filter(|name|!name.is_empty() && !name.chars().any(char::is_control))
+                            .map(|name|name.trim_start_matches('+').to_string())
+                            .unwrap_or_else(||format!("<unresolved function #{index}>"))
+                    }).collect();
                 let name=type_names.get((type_id&0x3fff) as usize)
                     .cloned().unwrap_or_else(||format!("type 0x{type_id:04X}"));
                 objects.push(SystemCatalogObject {
-                    name,type_id,parent_type,all_member_count,instance_fields
+                    name,type_id,parent_type,all_member_count,instance_fields,
+                    function_definitions,
                 });
             }
             1=>{r.bytes(word(item,4)?.checked_mul(8)
@@ -1750,6 +1765,60 @@ fn system_property_name(
     if obj.parent_type!=type_id {
         system_property_name(objects,obj.parent_type,member,depth+1)
     } else {None}
+}
+
+
+fn report_system_catalog(objects:&[SystemCatalogObject], source:&str) {
+    println!("=== PB333 SYSTEM CATALOG METADATA ===");
+    println!("Source: {source}");
+    println!("No DB values, embedded literals, executable function bodies or credentials.\n");
+    println!("System class objects parsed: {}",objects.len());
+    let transaction=objects.iter().find(|x|x.name.eq_ignore_ascii_case("transaction"));
+    match transaction {
+        Some(trans)=>{
+            println!("\nTransaction class: type=0x{:04X}, parent=0x{:04X}, all fields={}",
+                trans.type_id,trans.parent_type,trans.all_member_count);
+            for idx in [2usize,14,15] {
+                let field=system_property_name(objects,trans.type_id,idx,0)
+                    .unwrap_or_else(||"<unresolved>".into());
+                println!("  PB P-code member #{idx}: {field}");
+            }
+        },
+        None=>println!("\nTransaction class not identified in this catalog."),
+    };
+    let system=objects.iter().find(|obj|obj.type_id==0x40d0)
+        .or_else(||objects.iter().find(|obj|
+            obj.name.eq_ignore_ascii_case("SystemFunctions")));
+    match system {
+        Some(obj)=>{
+            println!("\nSystem function owner: {} (0x{:04X}, {} definitions)",
+                obj.name,obj.type_id,obj.function_definitions.len());
+            let idx=339usize;
+            match obj.function_definitions.get(idx) {
+                Some(function)=>println!("  P-code system function 0x40D0:339 = {function}"),
+                None=>println!("  P-code system function index 339 not in this definition table"),
+            }
+        },
+        None=>println!("\nSystem function class 0x40D0 not identified."),
+    }
+    println!("\nNote: both names come from the external PB333 system type group.");
+}
+
+fn inspect_external_system_catalog(file:&str)
+    -> Result<(),Box<dyn std::error::Error>>
+{
+    const MAX_CATALOG_BYTES:usize=32*1024*1024;
+    let metadata=std::fs::metadata(file)?;
+    if metadata.len()>MAX_CATALOG_BYTES as u64 {
+        return Err("system catalog exceeds 32 MiB safety limit".into());
+    }
+    let data=std::fs::read(file)?;
+    if data.starts_with(&[0x1f,0x8b]) {
+        return Err("the supplied file is GZIP; first run gzip -dc 014d.bin > /tmp/pb333_typedef.grp".into());
+    }
+    let objects=parse_system_objects(&data)?;
+    report_system_catalog(&objects,file);
+    Ok(())
 }
 
 fn transaction_catalog_scan(parser:&PblParser) -> Result<(),Box<dyn std::error::Error>> {
@@ -1979,6 +2048,12 @@ fn disassemble_one(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|arg|arg=="--system-metadata").unwrap_or(false) {
+        if args.len()!=2 {
+            return Err("usage: probe_pcode --system-metadata /tmp/pb333_typedef.grp".into());
+        }
+        return inspect_external_system_catalog(&args[1]);
+    }
     if args.first().map(|arg|arg=="--transaction-field-evidence").unwrap_or(false) {
         if args.len()!=1 {
             return Err("usage: probe_pcode --transaction-field-evidence".into());
@@ -2116,6 +2191,20 @@ mod semantic_probe_tests {
     use super::*;
 
     #[test]
+    fn pb333_system_function_uses_definition_index_not_global_id() {
+        let obj=SystemCatalogObject {
+            name:"SystemFunctions".into(),type_id:0x40d0,parent_type:0xFFFF,
+            all_member_count:0,instance_fields:Vec::new(),
+            function_definitions:(0..340).map(|idx|
+                if idx==339 {"documented_sample_function".into()}
+                else {format!("other_{idx}")}).collect(),
+        };
+        assert_eq!(obj.function_definitions.get(339).map(String::as_str),
+            Some("documented_sample_function"));
+    }
+
+
+    #[test]
     fn pb333_casts_do_not_clear_expression_stack() {
         let symbols = FunctionSymbols {
             code: Vec::new(), stack_buffer: Vec::new(),
@@ -2155,11 +2244,13 @@ mod semantic_probe_tests {
     fn catalog_members_resolve_own_and_inherited_slots() {
         let base=SystemCatalogObject {
             name:"base".into(),type_id:0x4001,parent_type:0xFFFF,
-            all_member_count:2,instance_fields:vec!["parent_a".into(),"parent_b".into()]
+            all_member_count:2,instance_fields:vec!["parent_a".into(),"parent_b".into()],
+            function_definitions:Vec::new(),
         };
         let trans=SystemCatalogObject {
             name:"transaction".into(),type_id:0x4013,parent_type:0x4001,
-            all_member_count:4,instance_fields:vec!["dbms".into(),"logpass".into()]
+            all_member_count:4,instance_fields:vec!["dbms".into(),"logpass".into()],
+            function_definitions:Vec::new(),
         };
         let objects=vec![base,trans];
         assert_eq!(system_property_name(&objects,0x4013,0,0),Some("parent_a".into()));
