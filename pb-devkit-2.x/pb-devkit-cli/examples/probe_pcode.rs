@@ -1492,6 +1492,82 @@ fn print_structured(sym: &FunctionSymbols, reveal_strings: bool)
 // Identify compiled PowerBuilder database connection sites without reading
 // credentials or displaying string literals. PB333 0x0005 maps through
 // PCodeParser110->105->100->90 to SqlOperateTransaction("connect").
+// Locate direct calls to a named PowerBuilder function across PB333
+// entries. Uses only function-table references, compiled opcodes, entry
+// names, body indices, call-site offsets and arity. Never prints call
+// arguments, string literals, SQL text, or transaction credentials.
+fn compiled_function_name_matches(actual:&str, requested:&str) -> bool {
+    actual.eq_ignore_ascii_case(requested) ||
+        actual.strip_suffix(".fun")
+            .is_some_and(|stem|stem.eq_ignore_ascii_case(requested))
+}
+
+fn scan_compiled_function_callers(
+    parser:&PblParser, target:&str,
+) -> Result<(),Box<dyn std::error::Error>> {
+    const SUFFIXES:&[&str]=&[".fun",".win",".apl",".udo"];
+    println!("=== DIRECT PB333 FUNCTION CALLERS (METADATA ONLY) ===");
+    println!("Target: {target}");
+    println!("Shows entry, body, call-site offset and compiled call arity.");
+    println!("No arguments, strings, passwords or connection parameters are displayed.");
+    let mut entries_considered=0usize;
+    let mut entries_skipped=0usize;
+    let mut matching_call_sites=0usize;
+    for entry in parser.entries().iter().filter(|e|
+        SUFFIXES.iter().any(|suffix|
+            e.name.to_ascii_lowercase().ends_with(*suffix)
+        )
+    ) {
+        entries_considered+=1;
+        let data=match parser.parse_chunk_chain(entry.data_offset,entry.size) {
+            Ok(data)=>data,
+            Err(_)=>{entries_skipped+=1;continue;}
+        };
+        let inspection=match inspect(&data) {
+            Ok(result) if result.problems.is_empty() &&
+                result.decoded_bodies==result.bodies=>result,
+            _=>{entries_skipped+=1;continue;}
+        };
+        for body in 0..inspection.bodies {
+            let symbols=match find_pcode_symbols(&data,body) {
+                Ok(symbols)=>symbols,
+                Err(_)=>continue,
+            };
+            if !symbols.referenced_functions.iter().any(|name|
+                compiled_function_name_matches(name,target)
+            ) {continue;}
+            let lines=match flow_instructions(&symbols.code) {
+                Ok(lines)=>lines,
+                Err(_)=>continue,
+            };
+            for (i,ins) in lines.iter().enumerate() {
+                if ins.opcode!=0x01bc {continue;}
+                let owner=flow_operand_word(&ins.operands,2);
+                if owner&0x8000==0 {continue;}
+                let ref_index=flow_operand_word(&ins.operands,0);
+                if !symbols.referenced_functions.get(ref_index)
+                    .is_some_and(|name|compiled_function_name_matches(name,target))
+                {continue;}
+                let next=lines.get(i+1);
+                let arity=next.filter(|v|v.opcode==0x01bd)
+                    .map(|v|flow_operand_word(&v.operands,2));
+                matching_call_sites+=1;
+                println!("CALLER {} body {} at 0x{:04X} | immediate call arity: {}",
+                    entry.name,body,ins.position,
+                    arity.map(|a|a.to_string())
+                        .unwrap_or_else(||"unverified".to_string()));
+            }
+        }
+    }
+    println!("SUMMARY entries={}, skipped={}, direct call sites={}",
+        entries_considered,entries_skipped,matching_call_sites);
+    if matching_call_sites==0 {
+        println!("No direct named call found in supported compiled entry types.");
+        println!("Indirect/dynamic calls or unsupported entry types remain possible.");
+    }
+    Ok(())
+}
+
 fn scan_db_connections(parser: &PblParser) -> Result<(), Box<dyn std::error::Error>> {
     const SUFFIXES: &[&str] = &[".fun", ".win", ".apl", ".udo"];
     let mut seen=0usize;
@@ -4586,6 +4662,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let parser=PblParser::new(EXE)?;
         return inspect_connection_sites(&parser,&args[1],index,catalog.as_deref(),show_sensitive);
     }
+    if args.first().map(|arg|arg=="--callers").unwrap_or(false) {
+        if args.len()!=2 {
+            return Err("usage: probe_pcode --callers <function_name>".into());
+        }
+        let parser=PblParser::new(EXE)?;
+        return scan_compiled_function_callers(&parser,&args[1]);
+    }
     if args.first().map(|arg|arg=="--db-scan").unwrap_or(false) {
         if args.len()!=1 {
             return Err("usage: probe_pcode --db-scan".into());
@@ -4905,6 +4988,14 @@ mod semantic_probe_tests {
         assert!(output.contains("A string #2 replaced by B local as_promis_ini"));
         assert!(output.contains("integer constant: same"));
         assert!(!output.contains("different-part"));
+    }
+
+    #[test]
+    fn compiled_function_name_match_handles_fun_suffix_and_case() {
+        assert!(compiled_function_name_matches("f_connect","F_CONNECT"));
+        assert!(compiled_function_name_matches("F_Connect.fun","f_connect"));
+        assert!(!compiled_function_name_matches("f_connect_debug","f_connect"));
+        assert!(!compiled_function_name_matches("f_heslo","f_connect"));
     }
 
     #[test]
