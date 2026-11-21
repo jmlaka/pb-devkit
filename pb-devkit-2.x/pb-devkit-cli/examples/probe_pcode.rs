@@ -1821,7 +1821,34 @@ fn gate_symbol_name(name:&str) -> &str {
     {name} else {"<unnamed>"}
 }
 
-fn redacted_gate_instruction(sym:&FunctionSymbols, ins:&FlowInsn) -> String {
+// Opt-in local inspection of compiled literals; no credential execution.
+fn sensitive_literal_at(sym:&FunctionSymbols, ins:&FlowInsn) -> Option<String> {
+    match ins.opcode {
+        0x003b=>{
+            let raw=ins.operands.get(..4)?;
+            let offset=u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+            let value=utf16_string(&sym.stack_buffer,offset)?;
+            Some(format!("string literal = \"{}\"",value.escape_debug()))
+        },
+        0x0034=>operand_i32(&ins.operands)
+            .map(|v|format!("integer literal = {v}")),
+        _=>None,
+    }
+}
+
+fn diagnostic_literal_info(
+    sym:&FunctionSymbols,ins:&FlowInsn,show_sensitive:bool
+) -> String {
+    if show_sensitive {
+        sensitive_literal_at(sym,ins).unwrap_or_else(||
+            "literal (decoder unavailable for this opcode)".into())
+    } else {
+        "literal <redacted> (content and numeric value suppressed)".into()
+    }
+}
+
+fn redacted_gate_instruction(sym:&FunctionSymbols, ins:&FlowInsn,
+    show_sensitive:bool) -> String {
     let op=ins.opcode;
     match op {
         0x001e|0x0030|0x014f|0x0150|0x0172|0x01a9|0x0200|
@@ -1846,7 +1873,7 @@ fn redacted_gate_instruction(sym:&FunctionSymbols, ins:&FlowInsn) -> String {
             }
         },
         0x0032..=0x003c | 0x01ff =>
-            "literal <redacted> (content and numeric value suppressed)".into(),
+            diagnostic_literal_info(sym,ins,show_sensitive),
         0x0002|0x0003|0x0004=>{
             let dest=flow_operand_word(&ins.operands,0);
             let form=if op==0x0002 {"if true"}
@@ -1888,9 +1915,14 @@ fn gate_trace_block_start(lines:&[FlowInsn], branch_position:usize)
         .max()
 }
 
-fn print_redacted_gate_trace(lines:&[FlowInsn],sym:&FunctionSymbols) {
+fn print_redacted_gate_trace(lines:&[FlowInsn],sym:&FunctionSymbols,
+    show_sensitive:bool) {
     println!("=== CONNECT GATE INSTRUCTION DIAGNOSTICS (REDACTED) ===");
-    println!("No source literals or raw operands. Type IDs, named symbols, opcodes and offsets only.");
+    if show_sensitive {
+        println!("SENSITIVE MODE: compiled literal values follow; keep output local.");
+    } else {
+        println!("No source literals or raw operands. Type IDs, named symbols, opcodes and offsets only.");
+    }
     for (gate, limit) in [(0x009cusize,80usize),(0x02d8usize,50usize)] {
         println!("\nGate at 0x{gate:04X}:");
         let Some(begin)=gate_trace_block_start(lines,gate) else {
@@ -1908,7 +1940,7 @@ fn print_redacted_gate_trace(lines:&[FlowInsn],sym:&FunctionSymbols) {
         for ins in block.iter().skip(omitted) {
             println!("  0x{:04X}  0x{:04X} {:<27} {}",
                 ins.position,ins.opcode,opcode_action(ins.opcode),
-                redacted_gate_instruction(sym,ins));
+                redacted_gate_instruction(sym,ins,show_sensitive));
         }
         // Print only unnamed locals referenced by this basic block:
         // identifies variable#9's declared type without its runtime value.
@@ -1933,7 +1965,8 @@ fn print_redacted_gate_trace(lines:&[FlowInsn],sym:&FunctionSymbols) {
     }
 }
 
-fn print_preconnect_routing(lines:&[FlowInsn], sym:&FunctionSymbols) {
+fn print_preconnect_routing(lines:&[FlowInsn], sym:&FunctionSymbols,
+    show_sensitive:bool) {
     println!("\n=== CONNECT ENTRY ROUTING (STATIC, REDACTED) ===");
     println!("Explores both outcomes of unknown conditions; stops at first CONNECT or RETURN.");
     let endpoints=next_connect_endpoints(lines,0);
@@ -1951,6 +1984,17 @@ fn print_preconnect_routing(lines:&[FlowInsn], sym:&FunctionSymbols) {
         let op=lines.iter().find(|ins|ins.position==*offset).map(|ins|ins.opcode);
         let condition=if op==Some(0x0003) {"IF NOT"} else {"IF"};
         println!("    {} {} (all constants redacted)",condition,predicate);
+        if show_sensitive {
+            if let Some(branch_idx)=lines.iter().position(|ins|ins.position==*offset) {
+                if let Some(literal)=branch_idx.checked_sub(3).and_then(|idx|lines.get(idx)) {
+                    if literal.opcode==0x003b {
+                        if let Some(value)=sensitive_literal_at(sym,literal) {
+                            println!("    Comparison constant: {value}");
+                        }
+                    }
+                }
+            }
+        }
         println!("    jump -> 0x{jump:04X}: {}",
             if jumps.is_empty() {"<none>".to_string()} else {jumps.join(", ")});
         println!("    fallthrough -> {}",
@@ -1959,7 +2003,11 @@ fn print_preconnect_routing(lines:&[FlowInsn], sym:&FunctionSymbols) {
     if gates.len()>40 {
         println!("  {} further distinguishing branches omitted",gates.len()-40);
     }
-    println!("Note: a branch's comparison is not reconstructed here; no literal values are printed.");
+    if !show_sensitive {
+        println!("Note: a branch's comparison is not reconstructed here; no literal values are printed.");
+    } else {
+        println!("Comparison literals are static constants, not runtime values.");
+    }
 }
 
 fn print_connection_control_flow(
