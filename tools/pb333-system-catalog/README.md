@@ -169,3 +169,33 @@ information. Never paste the unredacted log into chats, tickets, or public
 repositories. For a private local log on Linux, use \`umask 077\` before
 redirecting output and protect/delete that log when finished. The tool does
 not transmit its output.
+
+
+## PB333 dynamic SQL final buffer rewrite and function #139
+
+The successful \`f_connect.fun\` paths reach one \`EXECUTE IMMEDIATE\`
+using \`ls_pom\`. The final assignment contains \`Len(ls_pom)\`, a numeric
+subtraction, a system-function call \`0x40D0:139\`, and a final string
+concatenation. The exact SQL text is **not** inferred.
+
+To identify system function \`#139\` and use its name in a safe structural
+preview, pass the external system type catalog as an optional **third
+positional argument after the body index**:
+
+```bash
+cargo test -p pb-devkit-cli --example probe_pcode
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --system-metadata /tmp/pb333_typedef.grp
+
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --post-connect-sql f_connect.fun 0 /tmp/pb333_typedef.grp
+```
+
+The catalog report now lists system function indexes \`139\` and \`339\`.
+The post-connect report names function \`#139\` where the exact final
+13-instruction rewrite matches. It also associates SQL-looking literal
+prefixes with their candidate \`ls_pom\` assignments. These are
+*structural observations*, not the evaluated SQL command.
+
+The global \`--show-sensitive\` option remains available for **local**
+inspection of compiled constants only. Do not share sensitive logs.
