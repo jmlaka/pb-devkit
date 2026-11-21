@@ -2071,6 +2071,82 @@ fn safe_immediate_return_hint(
     }
 }
 
+// Path-sensitive, direct-assign evidence. Each state is a bitmask indicating
+// that this control-flow path has *encountered* a typed transaction member
+// BeginAssign opcode. This is NOT data-flow proof of a completed assignment,
+// and does not account for indirect/method-based changes to a transaction.
+fn transaction_assignment_path_states(
+    lines:&[FlowInsn],sym:&FunctionSymbols,objects:&[SystemCatalogObject]
+) -> std::collections::BTreeMap<usize,std::collections::BTreeSet<u8>> {
+    use std::collections::{BTreeMap,BTreeSet};
+    let positions:BTreeMap<usize,usize>=lines.iter().enumerate()
+        .map(|(i,ins)|(ins.position,i)).collect();
+    let mut begins=BTreeMap::<usize,u8>::new();
+    for triple in lines.windows(3) {
+        if triple[2].opcode!=0x0122 {continue;}
+        let Some(name)=catalog_transaction_property(
+            sym,&triple[0],&triple[1],objects) else {continue;};
+        let bit=match name.to_ascii_lowercase().as_str() {
+            "dbms"=>1u8,
+            "autocommit"=>2u8,
+            "dbparm"=>4u8,
+            _=>continue,
+        };
+        begins.insert(triple[2].position,bit);
+    }
+    let mut visited=BTreeSet::<(usize,u8)>::new();
+    let mut todo=vec![(0usize,0u8)];
+    let mut outcomes=BTreeMap::<usize,BTreeSet<u8>>::new();
+    while let Some((offset,initial_state))=todo.pop() {
+        if !visited.insert((offset,initial_state)) {continue;}
+        let Some(&index)=positions.get(&offset) else {continue;};
+        let ins=&lines[index];
+        let state=initial_state | begins.get(&offset).copied().unwrap_or(0u8);
+        if ins.opcode==0x0005 {
+            outcomes.entry(offset).or_default().insert(state);
+        }
+        match ins.opcode {
+            0x0000|0x0001=>{},
+            0x0004=>todo.push((flow_operand_word(&ins.operands,0),state)),
+            0x0002|0x0003=>{
+                todo.push((flow_operand_word(&ins.operands,0),state));
+                todo.push((ins.end,state));
+            },
+            _=>todo.push((ins.end,state)),
+        }
+    }
+    outcomes
+}
+
+fn print_transaction_assignment_paths(
+    lines:&[FlowInsn],sym:&FunctionSymbols,
+    objects:Option<&[SystemCatalogObject]>,
+) {
+    println!("\n=== DIRECT TRANSACTION ASSIGNMENTS ON CONNECT PATHS ===");
+    println!("Evidence: typed BeginAssign opcodes reachable on each static path.");
+    println!("This is not proof of completed writes or final DBParm values.");
+    let Some(objects)=objects else {
+        println!("Skipped: requires external PB333 system catalog.");
+        return;
+    };
+    let outcomes=transaction_assignment_path_states(lines,sym,objects);
+    for ins in lines.iter().filter(|ins|ins.opcode==0x0005) {
+        let Some(states)=outcomes.get(&ins.position) else {
+            println!("CONNECT 0x{:04X}: not reachable in static CFG",ins.position);
+            continue;
+        };
+        println!("CONNECT 0x{:04X}: {} distinct direct-assignment state(s)",
+            ins.position,states.len());
+        for (name,bit) in [("DBMS",1u8),("AutoCommit",2),("DBParm",4)] {
+            let yes=states.iter().filter(|&&state|state&bit!=0).count();
+            let summary=if yes==states.len() {"ALL paths"}
+                else if yes==0 {"NO paths"} else {"SOME paths"};
+            println!("  {name}: direct BeginAssign encountered on {summary}");
+        }
+    }
+    println!("Caveat: object initialization and indirect runtime changes not analyzed.");
+}
+
 fn print_connect_return_map(lines:&[FlowInsn], sym:&FunctionSymbols) {
     println!("\n=== CONNECT RETURN CONTRACT (REDACTED STATIC TRACE) ===");
     println!("Reachable RETURN sites, nearby opcodes and conservative payload hints.");
@@ -2233,6 +2309,7 @@ fn inspect_connection_sites(
     print_connection_control_flow(&lines,&symbols,system_catalog,&connect_indices);
     print_preconnect_routing(&lines,&symbols);
     print_connect_return_map(&lines,&symbols);
+    print_transaction_assignment_paths(&lines,&symbols,system_catalog);
     Ok(())
 }
 
@@ -2801,6 +2878,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn path_sensitive_transaction_assignment_does_not_inherit_skipped_branch() {
+        let mut buffer=vec![0u8;18];
+        buffer[8..12].copy_from_slice(&0xffffu32.to_le_bytes());
+        buffer[12..14].copy_from_slice(&15u16.to_le_bytes());
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:buffer,
+            locals:vec![VariableSymbol {
+                name:"at_sql".into(),global_index:None,type_id:0x8000,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:vec!["transaction".into()],
+        };
+        let objects=vec![SystemCatalogObject {
+            name:"transaction".into(),type_id:0x4084,parent_type:0xffff,
+            all_member_count:16,instance_fields:(0..16).map(|i|
+                if i==15 {"dbparm".into()} else {format!("p{i}")}).collect(),
+            function_definitions:Vec::new(),
+        }];
+        let lines=vec![
+            FlowInsn {position:0,end:4,opcode:0x0003,operands:vec![30,0]},
+            FlowInsn {position:4,end:8,opcode:0x0030,operands:vec![0,0]},
+            FlowInsn {position:8,end:14,opcode:0x0020,operands:vec![8,0,0,0]},
+            FlowInsn {position:14,end:18,opcode:0x0122,operands:vec![0,0]},
+            FlowInsn {position:18,end:20,opcode:0x0088,operands:vec![]},
+            FlowInsn {position:20,end:22,opcode:0x0005,operands:vec![]},
+            FlowInsn {position:22,end:24,opcode:0x0000,operands:vec![]},
+            FlowInsn {position:30,end:32,opcode:0x0005,operands:vec![]},
+            FlowInsn {position:32,end:34,opcode:0x0000,operands:vec![]},
+        ];
+        let states=transaction_assignment_path_states(&lines,&sym,&objects);
+        assert_eq!(states.get(&20).unwrap().iter().copied().collect::<Vec<_>>(),
+            vec![4u8]);
+        assert_eq!(states.get(&30).unwrap().iter().copied().collect::<Vec<_>>(),
+            vec![0u8]);
+    }
+
 
     #[test]
     fn return_contract_only_shows_whitelisted_status_literals() {
