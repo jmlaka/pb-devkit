@@ -1528,8 +1528,67 @@ fn referenced_function_at(sym: &FunctionSymbols, ins: &FlowInsn) -> Option<Strin
         .cloned().unwrap_or_else(||format!("function-ref#{index}")))
 }
 
+// Resolve an index-only member name using the external PB333 system catalog.
+// Only trust the catalog when the target object has a local type explicitly
+// named "transaction". Do not apply a transaction field index to other types.
+fn catalog_transaction_property(
+    sym:&FunctionSymbols,
+    op:&FlowInsn,
+    descriptor:&FlowInsn,
+    objects:&[SystemCatalogObject],
+) -> Option<String> {
+    if !matches!(op.opcode,0x001e|0x0030|0x01a9|0x0150) ||
+        descriptor.opcode!=0x0020 {return None;}
+    let local=flow_operand_word(&op.operands,0);
+    let var=sym.locals.get(local)?;
+    let name=if var.type_id&0xf000==0x8000 {
+        sym.type_names.get((var.type_id&0x3fff) as usize)?
+    } else {return None;};
+    if !name.eq_ignore_ascii_case("transaction") {return None;}
+    let descriptor_offset=operand_u16(&descriptor.operands)? as usize;
+    let record=sym.stack_buffer.get(descriptor_offset..descriptor_offset.checked_add(6)?)?;
+    let raw_ptr=u32::from_le_bytes([record[0],record[1],record[2],record[3]]);
+    if raw_ptr&0xffff != 0xffff {return None;}
+    let member=u16::from_le_bytes([record[4],record[5]]) as usize;
+    let transaction=objects.iter().find(|x|x.name.eq_ignore_ascii_case("transaction"))?;
+    system_property_name(objects,transaction.type_id,member,0)
+}
+
+// List only a controlled vocabulary of DBParm configuration key *names*.
+// Never print arbitrary text from the application, even for near matches.
+// This is heuristic: keys fragmented across literals may not be detected.
+fn known_dbparm_keys(sym:&FunctionSymbols, instructions:&[FlowInsn]) -> Vec<&'static str> {
+    const KEYS:&[&str]=&[
+        "ConnectString","DSN","UID","PWD","UserID","Password",
+        "DatabaseName","DBN","ENG","CommLinks","Host","Port",
+        "AutoStop","DelimitIdentifier","IsolationLevel","SQLCA",
+    ];
+    let mut known=std::collections::BTreeSet::<&str>::new();
+    for ins in instructions.iter().filter(|ins|ins.opcode==0x003b) {
+        let Some(raw)=ins.operands.get(..4) else {continue;};
+        let offset=u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+        let Some(value)=utf16_string(&sym.stack_buffer,offset) else {continue;};
+        let low=value.to_ascii_lowercase();
+        for key in KEYS {
+            let needle=key.to_ascii_lowercase();
+            for (index,_) in low.match_indices(&needle) {
+                let prefix=low[..index].chars().last();
+                let after=low[index+needle.len()..].trim_start();
+                // Require a syntactic assignment, and no preceding name
+                // character. No value or substring from the source is emitted.
+                if (prefix.is_none() || prefix.is_some_and(|c|
+                    !c.is_ascii_alphanumeric() && c!='_')) &&
+                    after.starts_with('=')
+                {known.insert(*key);}
+            }
+        }
+    }
+    known.into_iter().collect()
+}
+
 fn inspect_connection_sites(
-    parser: &PblParser, name: &str, body_index: usize
+    parser: &PblParser, name: &str, body_index: usize,
+    system_catalog: Option<&[SystemCatalogObject]>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entry=parser.entries().iter()
         .find(|e|e.name.eq_ignore_ascii_case(name))
@@ -1545,7 +1604,11 @@ fn inspect_connection_sites(
     println!("Entry: {} | body: {} | CONNECT sites: {}",
         entry.name,body_index,connect_indices.len());
     println!("Only property names, function names and instruction offsets.");
-    println!("No source string values, passwords, or connection strings are decoded.\n");    for (i,var) in symbols.locals.iter().enumerate() {
+    println!("No source string values, passwords, or connection strings are displayed.\n");
+    if system_catalog.is_some() {
+        println!("External PB333 system catalog: loaded and used for transaction fields.");
+    }
+    for (i,var) in symbols.locals.iter().enumerate() {
         if var.name.eq_ignore_ascii_case("at_sql") ||
             var.name.to_ascii_lowercase().contains("sql")
         {
@@ -1580,7 +1643,13 @@ fn inspect_connection_sites(
                     // never the value subsequently assigned.
                     if let Some(prev)=i.checked_sub(1).and_then(|j|segment.get(j)) {
                         if prev.opcode==0x0020 {
-                            let field=flow_field_name(&symbols,&prev.operands);
+                            let field=match (system_catalog,
+                                i.checked_sub(2).and_then(|j|segment.get(j))) {
+                                (Some(objects),Some(object)) =>
+                                    catalog_transaction_property(&symbols,object,prev,objects)
+                                        .unwrap_or_else(||flow_field_name(&symbols,&prev.operands)),
+                                _=>flow_field_name(&symbols,&prev.operands)
+                            };
                             let metadata=field_descriptor_metadata(&symbols,&prev.operands);
                             let mut associated_calls=Vec::new();
                             // Only calls contained in this assignment expression;
@@ -1627,6 +1696,14 @@ fn inspect_connection_sites(
             println!("      descriptor: {metadata}");
             if !associated_calls.is_empty() {
                 println!("      calls inside assignment: {}",associated_calls.join(", "));
+            }
+        }
+        if system_catalog.is_some() {
+            let keys=known_dbparm_keys(&symbols,segment);
+            if !keys.is_empty() {
+                println!("  Recognized configuration keys in this segment (names only): {}",
+                    keys.join(", "));
+                println!("  (heuristic: presence in literals, not proof of active DBParm assignment)");
             }
         }
         if !calls.is_empty() {
@@ -2067,12 +2144,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return transaction_catalog_scan(&parser);
     }
     if args.first().map(|arg|arg=="--connect-map").unwrap_or(false) {
-        if args.len()<2 || args.len()>3 {
-            return Err("usage: probe_pcode --connect-map <object.fun> [body_index]".into());
+        if args.len()<2 || args.len()>4 {
+            return Err("usage: probe_pcode --connect-map <object.fun> [body_index] [catalog.grp]".into());
         }
         let index=args.get(2).map(|s|s.parse::<usize>()).transpose()?.unwrap_or(0);
+        let catalog=if let Some(path)=args.get(3) {
+            let bytes=std::fs::read(path)?;
+            Some(parse_system_objects(&bytes)?)
+        } else {None};
         let parser=PblParser::new(EXE)?;
-        return inspect_connection_sites(&parser,&args[1],index);
+        return inspect_connection_sites(&parser,&args[1],index,catalog.as_deref());
     }
     if args.first().map(|arg|arg=="--db-scan").unwrap_or(false) {
         if args.len()!=1 {
@@ -2189,6 +2270,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn dbparm_key_detector_never_returns_secret_literal() {
+        let mut stack=vec![0u8;24];
+        let secret="ConnectString='DSN=SecretDB;UID=somebody;PWD=NeverPrintMe'";
+        for unit in secret.encode_utf16().chain(std::iter::once(0)) {
+            stack.extend_from_slice(&unit.to_le_bytes());
+        }
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:stack,locals:Vec::new(),
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let ins=FlowInsn {
+            position:0,end:6,opcode:0x003b,
+            operands:(24u32).to_le_bytes().to_vec(),
+        };
+        let keys=known_dbparm_keys(&sym,&[ins]);
+        assert!(keys.contains(&"DSN"));
+        assert!(keys.contains(&"UID"));
+        assert!(keys.contains(&"PWD"));
+        assert!(keys.contains(&"ConnectString"));
+        assert!(!keys.join(",").contains("NeverPrintMe"));
+        assert!(!keys.join(",").contains("somebody"));
+    }
+
+    #[test]
+    fn catalogs_match_only_a_typed_transaction_object() {
+        let var=VariableSymbol {
+            name:"at_sql".into(),global_index:None,type_id:0x8000,
+        };
+        let mut buffer=vec![0u8;24];
+        buffer[8..12].copy_from_slice(&0xffffu32.to_le_bytes());
+        buffer[12..14].copy_from_slice(&15u16.to_le_bytes());
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:buffer,
+            locals:vec![var],globals:Vec::new(),
+            referenced_functions:Vec::new(),sql_pool:Vec::new(),
+            type_names:vec!["transaction".into()],
+        };
+        let obj=SystemCatalogObject {
+            name:"transaction".into(),type_id:0x4084,parent_type:0xffff,
+            all_member_count:16,instance_fields:(0..16).map(|i|
+                if i==15 {"dbparm".into()} else {format!("property{i}")}).collect(),
+            function_definitions:Vec::new(),
+        };
+        let ref_local=FlowInsn {
+            position:0,end:4,opcode:0x0030,operands:vec![0,0]
+        };
+        let field=FlowInsn {
+            position:4,end:10,opcode:0x0020,operands:vec![8,0,0,0]
+        };
+        let objects=vec![obj];
+        assert_eq!(
+            catalog_transaction_property(&sym,&ref_local,&field,&objects),
+            Some("dbparm".into()));
+    }
+
 
     #[test]
     fn pb333_system_function_uses_definition_index_not_global_id() {
