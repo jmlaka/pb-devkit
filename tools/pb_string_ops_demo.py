@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Offline reproduction of observed PowerBuilder string operations.
 
---mode-a-json assembles ONLY the pre-CONNECT Mode A ls_pom expression from
-manually supplied, sanitized literals. It intentionally does not derive or
-apply real UID/PWD values, call f_heslo, or make a database connection.
+--mode-a-json assembles the pre-CONNECT Mode A ls_pom expression from
+manually supplied local literals. It prints the assembled string verbatim,
+including any UID/PWD fields present in those inputs. It does not derive
+credentials, evaluate f_heslo, or make a database connection.
 
-All input remains local. Do not commit recipes made with application data.
+Keep recipes and output private: do not commit application-derived literals,
+connection strings, or credentials to a repository.
 PowerBuilder length is not necessarily identical to Python's code-point len()
 for every non-ASCII character; these examples use ASCII.
 """
@@ -15,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import re
 import unittest
 
 
@@ -77,27 +78,6 @@ def mode_a_template(
     return result
 
 
-def validate_no_clear_credential_fields(text: str) -> None:
-    """Refuse obvious unredacted credential assignments before printing.
-
-    This check is a guardrail, not a reliable scrubber for arbitrary formats.
-    Users must redact sensitive fragments BEFORE constructing the recipe.
-    """
-    for match in re.finditer(
-        r"(?i)(?<![A-Za-z0-9_])(?:UID|PWD|LOGID|LOGPASS|PASSWORD|USERID)\s*=\s*",
-        text,
-    ):
-        remainder = text[match.end():]
-        field = re.split(r"[;,]", remainder, maxsplit=1)[0].strip().strip("'\"")
-        if field and field.upper() not in {
-            "<REDACTED>", "<UID>", "<PWD>", "[REDACTED]", "REDACTED"
-        }:
-            raise ValueError(
-                "A credential field may contain an unredacted value. "
-                "Replace it locally with <REDACTED> before using this script."
-            )
-
-
 def load_mode_a_recipe(path: Path) -> str:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -109,7 +89,6 @@ def load_mode_a_recipe(path: Path) -> str:
     result = mode_a_template(
         payload["literals"], payload["n_00E0"], payload["as_conname"]
     )
-    validate_no_clear_credential_fields(result)
     return result
 
 
@@ -160,15 +139,16 @@ class StringOperationsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mode_a_template({key: "x" for key in MODE_A_OFFSETS}, -1, "demo")
 
-    def test_reject_clear_credential_fields(self) -> None:
-        validate_no_clear_credential_fields(
-            "DSN=EXAMPLE;UID=<REDACTED>;PWD=<REDACTED>;")
-        with self.assertRaises(ValueError):
-            validate_no_clear_credential_fields("DSN=EXAMPLE;PWD=secret;")
-        with self.assertRaises(ValueError):
-            validate_no_clear_credential_fields("UID=example;PWD=<REDACTED>")
-        with self.assertRaises(ValueError):
-            validate_no_clear_credential_fields("ConnectString=\'UID=private;PWD=private\'")
+    def test_mode_a_outputs_full_local_string(self) -> None:
+        pieces = {key: "" for key in MODE_A_OFFSETS}
+        pieces["00B6"] = "DSN=EXAMPLE;"
+        pieces["00BC"] = "UID=test-user;"
+        pieces["00C6"] = "PWD=test-password;"
+        pieces["00DA"] = "*"
+        self.assertEqual(
+            mode_a_template(pieces, 0, ""),
+            "DSN=EXAMPLE;UID=test-user;PWD=test-password;"
+        )
 
 
 if __name__ == "__main__":
@@ -177,7 +157,7 @@ if __name__ == "__main__":
     group.add_argument("--test", action="store_true",
                        help="run synthetic unit tests")
     group.add_argument("--mode-a-json", type=Path, metavar="PATH",
-                       help="assemble sanitized pre-CONNECT Mode A ls_pom from a local JSON recipe")
+                       help="print pre-CONNECT Mode A ls_pom from local JSON verbatim")
     args = parser.parse_args()
     if args.test:
         unittest.main(argv=["pb_string_ops_demo"], exit=False)
