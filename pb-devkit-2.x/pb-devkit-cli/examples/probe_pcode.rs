@@ -2866,6 +2866,55 @@ fn print_post_connect_sql_trace(
     println!("Read-only safety must be enforced by separate DB credentials/privileges.");
 }
 
+// Strict expression-only stack interpreter for one catalog-verified
+// DBParm assignment. Literal strings and integer constants are suppressed.
+// This is static bytecode provenance, NOT an evaluated connection string.
+// Unknown opcodes or stack underflow cause refusal rather than an invented
+// formula. The full formula is capped to avoid excessive output.
+fn redacted_dbparm_expression(
+    region:&[FlowInsn],sym:&FunctionSymbols,
+)->Result<String,&'static str> {
+    if region.len()<3 || region[0].opcode!=0x0122 ||
+        !matches!(region.last().map(|x|x.opcode),
+            Some(0x007f..=0x008c|0x0104..=0x0118|
+                 0x0159|0x0205|0x0207..=0x0209))
+    {return Err("not a completed instance-property assignment");}
+    let body=&region[1..region.len()-1];
+    let mut stack=Vec::<String>::new();
+    for ins in body {
+        if ins.opcode==0x0034 {
+            stack.push("<integer-hidden>".into());
+            continue;
+        }
+        if !matches!(ins.opcode,
+            0x001e|0x0030|0x01a9|0x0150|
+            0x003b|0x003f|0x008e|0x0139|
+            0x0123..=0x012b|0x012d..=0x013e|
+            0x007d|0x01bc|0x01bd)
+        {return Err("unsupported expression opcode");}
+        if matches!(ins.opcode,0x007d) && stack.len()<2 {
+            return Err("binary operation stack underflow");
+        }
+        if ins.opcode==0x01bd {
+            let args=flow_operand_word(&ins.operands,2);
+            if stack.len()<args+1 || args>16 {
+                return Err("function-call stack underflow or unexpected arity");
+            }
+        }
+        let statement=flow_statement(ins,sym,&mut stack,false);
+        if statement.is_some() {return Err("unexpected statement in expression");}
+        if stack.len()>32 {return Err("expression stack depth over limit");}
+    }
+    if stack.len()!=1 {return Err("expression did not leave exactly one value");}
+    let expression=stack.pop().ok_or("empty expression stack")?;
+    if expression.len()>3000 {return Err("redacted formula exceeds limit");}
+    if expression.contains("<missing") ||
+        expression.contains("<string-offset-unresolved>") ||
+        expression.contains("<invalid")
+    {return Err("symbolic expression contains unresolved input");}
+    Ok(expression)
+}
+
 // Read-only diagnostic for the lexical interval containing each CONNECT.
 // A completed typed DBParm assignment is located using a catalog-verified
 // transaction member. No string, integer value, operand bytes, hash or
@@ -3185,6 +3234,10 @@ fn print_dbparm_call_context(
             region.len(),
             region.iter().filter(|x|x.opcode==0x003b).count(),
             region.iter().filter(|x|x.opcode==0x0034).count());
+        match redacted_dbparm_expression(region,sym) {
+            Ok(formula)=>println!("  Symbolic DBParm source: {}",formula),
+            Err(reason)=>println!("  Symbolic DBParm source: unresolved ({reason})"),
+        }
         let mut source_locals=std::collections::BTreeSet::new();
         for ins in region {
             if !matches!(ins.opcode,0x001e|0x0030|0x01a9|0x0150) {continue;}
@@ -4492,6 +4545,43 @@ mod semantic_probe_tests {
             "default branch");
         lines.iter_mut().find(|v|v.position==0x005e).unwrap().opcode=0x0002;
         assert!(pb333_heslo_username_branch_strings(&lines,&sym).is_none());
+    }
+
+    #[test]
+    fn dbparm_expression_is_redacted_and_refuses_partial_stacks() {
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:vec![0;16],locals:Vec::new(),
+            globals:Vec::new(),referenced_functions:vec![
+                "f_heslo".into(),"f_nahrad_znaky".into(),
+            ],sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let seq=[
+            (0x0122,vec![0,0]),
+            (0x003b,0u32.to_le_bytes().to_vec()),
+            (0x003b,0u32.to_le_bytes().to_vec()),
+            (0x01bc,vec![0,0,1,0x80]),
+            (0x01bd,vec![0,0,2,0,0,0]),
+            (0x003b,0u32.to_le_bytes().to_vec()),
+            (0x003b,0u32.to_le_bytes().to_vec()),
+            (0x01bc,vec![1,0,1,0x80]),
+            (0x01bd,vec![1,0,3,0,0,0]),
+            (0x013b,vec![0,0]),
+            (0x0088,vec![]),
+        ];
+        let lines=seq.into_iter().enumerate().map(|(i,(opcode,operands))|
+            FlowInsn {position:i*10,end:(i+1)*10,opcode,operands}
+        ).collect::<Vec<_>>();
+        // String at pool offset zero is empty but is still redacted.
+        let formula=redacted_dbparm_expression(&lines,&sym).unwrap();
+        assert!(formula.starts_with("f_nahrad_znaky("));
+        assert!(formula.contains("f_heslo("));
+        assert!(!formula.contains("Password="));
+        let mut underflow=lines.clone();
+        underflow[8].operands[2]=6;
+        assert!(redacted_dbparm_expression(&underflow,&sym).is_err());
+        let mut unknown=lines.clone();
+        unknown[5].opcode=0x020f;
+        assert!(redacted_dbparm_expression(&unknown,&sym).is_err());
     }
 
     #[test]
