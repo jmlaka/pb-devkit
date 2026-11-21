@@ -3647,6 +3647,140 @@ fn print_local_metadata_only(sym:&FunctionSymbols,lines:&[FlowInsn]) {
     }
 }
 
+// PB333 compiled function-definition metadata, using the 48-byte record
+// and 12-byte ordered argument descriptors documented in PbdViewer PbEntry.
+// These pools hold symbol names, NOT function-body string constants.
+struct Pb333FormalSignature {
+    name:String,
+    params:Vec<(String,u16)>,
+    return_type:u16,
+}
+
+fn pb333_signature_from_record(
+    record:&[u8],function_buffer:&[u8],param_buffer:&[u8],
+) -> Result<Pb333FormalSignature,String> {
+    let u32at=|bytes:&[u8],at:usize|->Result<u32,String> {
+        let p=bytes.get(at..at+4).ok_or("short function metadata")?;
+        Ok(u32::from_le_bytes([p[0],p[1],p[2],p[3]]))
+    };
+    if record.len()!=48 {return Err("PB333 function definition is not 48 bytes".into());}
+    let name=utf16_string(function_buffer,u32at(record,0)?)
+        .ok_or("function name pointer cannot be resolved")?;
+    let params_at=u32at(record,8)?;
+    let count=record[30] as usize;
+    let return_type=u16::from_le_bytes([record[28],record[29]]);
+    let mut params=Vec::new();
+    if params_at==65535 {
+        if count!=0 {return Err("no parameter table but count is nonzero".into());}
+    } else {
+        let begin=params_at as usize;
+        for i in 0..count {
+            let offset=begin.checked_add(i*12)
+                .ok_or("parameter descriptor offset overflow")?;
+            let param=param_buffer.get(offset..offset+12)
+                .ok_or("parameter descriptor out of bounds")?;
+            let pname=utf16_string(function_buffer,u32at(param,0)?)
+                .ok_or("parameter name pointer cannot be resolved")?;
+            let typ=u16::from_le_bytes([param[8],param[9]]);
+            params.push((pname,typ));
+        }
+    }
+    Ok(Pb333FormalSignature {name,params,return_type})
+}
+
+// Walk the compiled entry in the same order as find_pcode_symbols, but
+// retain the 4-byte body-index records and 48-byte function definitions.
+// PbdViewer ReadFunction() maps body index bytes +2 to definition index.
+// The function and parameter pools are metadata only.
+fn pb333_formal_signature(
+    data:&[u8],selected:usize,
+)->Result<Pb333FormalSignature,String> {
+    let mut r=Cursor::new(data);
+    if r.u16()?!=333 {return Err("not a PB333 compiled entry".into());}
+    r.bytes(22)?;
+    let header_descriptors=r.u16()? as usize;
+    r.bytes(header_descriptors*12)?;
+    r.struct_buffer()?;
+    r.records20()?;
+    let objects=r.u16()? as usize;
+    let extended_count=r.u16()? as usize;
+    let function_buffer=pool_buffer(&mut r)?;
+    let param_buffer=pool_buffer(&mut r)?;
+    r.records20()?;
+    r.records20()?;
+    let index_bytes=r.bytes(objects*16)?.to_vec();
+    let extended=r.bytes(extended_count*32)?.to_vec();
+    let mut used_extended=0usize;
+    let mut body_index=0usize;
+
+    for index in index_bytes.chunks_exact(16) {
+        match (index[0]>>1)&7 {
+            0=>{
+                let begin=used_extended*32;
+                let header=extended.get(begin..begin+32)
+                    .ok_or("missing extended object header")?;
+                used_extended+=1;
+                let bodies=r.u16()? as usize;
+                let raw_body_indices=r.bytes(bodies*4)?;
+                let definitions=raw_body_indices.chunks_exact(4)
+                    .map(|part|u16::from_le_bytes([part[2],part[3]]) as usize)
+                    .collect::<Vec<_>>();
+                let mut wanted=None;
+                for def in definitions {
+                    let code_len=r.u16()? as usize;
+                    let debug_len=r.u16()? as usize;
+                    r.u16()?;
+                    r.bytes(code_len)?;
+                    r.bytes(debug_len*4)?;
+                    r.records20()?;
+                    r.struct_buffer()?;
+                    if body_index==selected {wanted=Some(def);}
+                    body_index+=1;
+                }
+                r.bytes(word(header,24)?*6)?;
+                r.bytes(word(header,22)?*4)?;
+                named_references(&mut r)?;
+                r.records20()?;
+                r.bytes(word(header,28)?*8)?;
+                r.bytes(word(header,26)?*16)?;
+                let definitions_count=word(header,4)?;
+                let definition_bytes=r.bytes(definitions_count*48)?;
+                if let Some(target)=wanted {
+                    let start=target.checked_mul(48)
+                        .ok_or("function definition index overflow")?;
+                    let record=definition_bytes.get(start..start+48)
+                        .ok_or("body's function definition index out of bounds")?;
+                    return pb333_signature_from_record(
+                        record,&function_buffer,&param_buffer
+                    );
+                }
+            },
+            1=>{r.bytes(word(index,4)?*8)?;},
+            _=>{},
+        }
+    }
+    Err(format!("function body index {selected} not found"))
+}
+
+fn print_formal_signature(
+    signature:&Pb333FormalSignature,sym:&FunctionSymbols,
+) {
+    println!("=== COMPILED FUNCTION SIGNATURE (METADATA ONLY) ===");
+    println!("Function: {}",gate_symbol_name(&signature.name));
+    println!("Return type id: 0x{:04X}",signature.return_type);
+    println!("Formal parameters: {}",signature.params.len());
+    for (i,(name,typ)) in signature.params.iter().enumerate() {
+        let local=sym.locals.get(i);
+        let local_match=local.is_some_and(|v|
+            v.name.eq_ignore_ascii_case(name) && v.type_id==*typ);
+        println!("  arg #{} {} : type 0x{:04X} | local[{i}] correspondence: {}",
+            i+1,gate_symbol_name(name),typ,
+            if local_match {"name and type match"} else {"unverified/mismatch"});
+    }
+    println!("Parameter names and order from compiled function-definition metadata;");
+    println!("no credential values or function-body literals decoded.");
+}
+
 fn disassemble_one(
     parser: &PblParser,
     name: &str,
@@ -3742,6 +3876,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.len()!=1 {return Err("usage: probe_pcode --transaction-catalog".into());}
         let parser=PblParser::new(EXE)?;
         return transaction_catalog_scan(&parser);
+    }
+    if args.first().map(|arg|arg=="--function-signature").unwrap_or(false) {
+        if args.len()!=3 {
+            return Err("usage: probe_pcode --function-signature <object.fun> <body_index>".into());
+        }
+        let body_index=args[2].parse::<usize>()?;
+        let parser=PblParser::new(EXE)?;
+        let entry=parser.entries().iter()
+            .find(|e|e.name.eq_ignore_ascii_case(&args[1]))
+            .ok_or_else(||format!("compiled entry not found: {}",args[1]))?;
+        let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+        let sym=find_pcode_symbols(&data,body_index)?;
+        let signature=pb333_formal_signature(&data,body_index)?;
+        print_formal_signature(&signature,&sym);
+        return Ok(());
     }
     if args.first().map(|arg|arg=="--function-locals").unwrap_or(false) {
         if args.len()!=3 {
@@ -3978,6 +4127,41 @@ mod semantic_probe_tests {
         assert_eq!(simple_structured_loop(&blocks,&terminal,blocks[1]),None);
     }
 
+
+    #[test]
+    fn pb333_signature_parser_uses_ordered_descriptors() {
+        let mut function_buffer=vec![0u8;16];
+        let mut at=Vec::<u32>::new();
+        for name in ["f_heslo","as_pouzivatel","as_dbms"] {
+            at.push(function_buffer.len() as u32);
+            for unit in name.encode_utf16().chain(std::iter::once(0)) {
+                function_buffer.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        let mut params=vec![0u8;24];
+        for (i,offset) in at.iter().copied().skip(1).enumerate() {
+            params[i*12..i*12+4].copy_from_slice(&offset.to_le_bytes());
+            params[i*12+8..i*12+10].copy_from_slice(&6u16.to_le_bytes());
+        }
+        let mut record=vec![0u8;48];
+        record[..4].copy_from_slice(&at[0].to_le_bytes());
+        record[8..12].copy_from_slice(&0u32.to_le_bytes());
+        record[28..30].copy_from_slice(&6u16.to_le_bytes());
+        record[30]=2;
+        let signature=pb333_signature_from_record(
+            &record,&function_buffer,&params).unwrap();
+        assert_eq!(signature.name,"f_heslo");
+        assert_eq!(signature.params,vec![
+            ("as_pouzivatel".into(),6),
+            ("as_dbms".into(),6),
+        ]);
+        record[8..12].copy_from_slice(&65535u32.to_le_bytes());
+        assert!(pb333_signature_from_record(
+            &record,&function_buffer,&params).is_err());
+        record[30]=0;
+        assert!(pb333_signature_from_record(
+            &record,&function_buffer,&params).unwrap().params.is_empty());
+    }
 
     #[test]
     fn local_usage_report_only_counts_direct_reads_and_assignment_begins() {
