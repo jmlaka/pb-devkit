@@ -2327,6 +2327,55 @@ fn sql_literal_intent(literal:&str) -> Option<&'static str> {
 // This only recognizes the structural expression; it does not evaluate any
 // string or the dynamic database statement. System function names are
 // resolved only from a version-matched system catalog.
+// Verify a compiler-emitted concatenation of constant strings that
+// *appends* to the previous value of the same local variable.
+//
+// BeginAssignLocal -> (literal + ... + literal) -> ResetAssign
+// -> Add -> Cast -> EndAssign.
+//
+// PbdViewer's ResetAssign duplicates the pending l-value beneath the
+// right-hand expression. The final Add therefore uses the old variable
+// value plus the new literal expression; it does not overwrite from scratch.
+fn recognized_literal_append(
+    segment:&[&FlowInsn],sym:&FunctionSymbols,show_sensitive:bool,
+) -> Option<(usize,Option<String>)> {
+    if segment.len()<9 {return None;}
+    let begin=segment[0];
+    let end=segment[segment.len()-1];
+    if begin.opcode!=0x011d || end.opcode!=0x0088 {return None;}
+    let tail=&segment[segment.len()-4..];
+    if tail[0].opcode!=0x0119 || tail[1].opcode!=0x007d ||
+        !matches!(tail[2].opcode,0x0123..=0x012b|0x012d..=0x013e) ||
+        tail[3].opcode!=0x0088 {return None;}
+    let rhs=&segment[1..segment.len()-4];
+    if rhs.len()<4 || (rhs.len()-4)%3!=0 {return None;}
+    if rhs[0].opcode!=0x003b || rhs[1].opcode!=0x003b ||
+        rhs[2].opcode!=0x007d ||
+        !matches!(rhs[3].opcode,0x0123..=0x012b|0x012d..=0x013e)
+    {return None;}
+    let mut literal_positions=vec![0usize,1usize];
+    for (i,group) in rhs[4..].chunks_exact(3).enumerate() {
+        if group[0].opcode!=0x003b ||
+            group[1].opcode!=0x007d ||
+            !matches!(group[2].opcode,0x0123..=0x012b|0x012d..=0x013e)
+        {return None;}
+        literal_positions.push(4+i*3);
+    }
+    let count=literal_positions.len();
+    let joined=if show_sensitive {
+        let mut value=String::new();
+        for pos in literal_positions {
+            let raw=rhs[pos].operands.get(..4)?;
+            let offset=u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+            let piece=utf16_string(&sym.stack_buffer,offset)?;
+            if value.len().saturating_add(piece.len())>16384 {return None;}
+            value.push_str(&piece);
+        }
+        Some(value)
+    } else {None};
+    Some((count,joined))
+}
+
 fn final_sql_source_rewrite(
     block:&[&FlowInsn], sym:&FunctionSymbols,
     system_catalog:Option<&[SystemCatalogObject]>,
@@ -2449,6 +2498,16 @@ fn print_post_connect_sql_trace(
                     Some(end_idx)=>{
                         println!("    Candidate assignment 0x{:04X}..0x{:04X}",
                             begin.position,block[end_idx].position);
+                        let complete_assignment=&block[begin_idx..=end_idx];
+                        if let Some((count,joined))=recognized_literal_append(
+                            complete_assignment,sym,show_sensitive
+                        ) {
+                            println!("      VERIFIED append using ResetAssign: previous ls_pom + {count} concatenated string literals");
+                            if let Some(value)=joined {
+                                println!("      Compiled appended literal string (local sensitive mode):");
+                                println!("        \"{}\"",value.escape_debug());
+                            }
+                        }
                         let assignment=&block[begin_idx+1..end_idx];
                         let mut functions=std::collections::BTreeSet::<String>::new();
                         for ins in assignment {
@@ -3271,6 +3330,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn reset_assign_literal_append_is_not_mistaken_for_replacement() {
+        let mut pool=vec![0u8;16];
+        let mut literal_offset=Vec::new();
+        for value in ["A","B","C"] {
+            literal_offset.push(pool.len() as u32);
+            for unit in value.encode_utf16().chain(std::iter::once(0)) {
+                pool.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer:pool,locals:Vec::new(),
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let codes=[
+            0x011d,0x003b,0x003b,0x007d,0x0128,
+            0x003b,0x007d,0x0129,0x0119,0x007d,0x012a,0x0088,
+        ];
+        let mut literal_index=0usize;
+        let mut ins=Vec::<FlowInsn>::new();
+        for (i,opcode) in codes.into_iter().enumerate() {
+            let operands=if opcode==0x003b {
+                let ret=literal_offset[literal_index].to_le_bytes().to_vec();
+                literal_index+=1;
+                ret
+            } else {vec![0,0,0,0]};
+            ins.push(FlowInsn{
+                position:i*6,end:(i+1)*6,opcode,operands,
+            });
+        }
+        let refs=ins.iter().collect::<Vec<_>>();
+        assert_eq!(recognized_literal_append(&refs,&sym,false),Some((3,None)));
+        assert_eq!(recognized_literal_append(&refs,&sym,true),
+            Some((3,Some("ABC".into()))));
+        ins[8].opcode=0x0139; // No ResetAssign -> not an append.
+        let wrong=ins.iter().collect::<Vec<_>>();
+        assert!(recognized_literal_append(&wrong,&sym,false).is_none());
+    }
+
 
     #[test]
     fn final_sql_rewrite_resolves_catalog_function_without_exposing_literals() {
