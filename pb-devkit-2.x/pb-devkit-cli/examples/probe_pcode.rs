@@ -2866,6 +2866,88 @@ fn print_post_connect_sql_trace(
     println!("Read-only safety must be enforced by separate DB credentials/privileges.");
 }
 
+// Read-only diagnostic for the lexical interval containing each CONNECT.
+// A completed typed DBParm assignment is located using a catalog-verified
+// transaction member. No string, integer value, operand bytes, hash or
+// connection-string fragment is printed. Lexical proximity does not prove
+// that the write actually reaches the CONNECT on a feasible control path.
+fn dbparm_completed_assignments(
+    lines:&[FlowInsn],sym:&FunctionSymbols,
+    catalog:&[SystemCatalogObject],
+) -> Vec<(usize,usize,usize)> {
+    let mut found=Vec::new();
+    let mut start=0usize;
+    for (connect_idx,connect) in lines.iter().enumerate() {
+        if connect.opcode!=0x0005 {continue;}
+        for begin in (start.saturating_add(2))..connect_idx {
+            if lines[begin].opcode!=0x0122 {continue;}
+            let Some(field)=catalog_transaction_property(
+                sym,&lines[begin-2],&lines[begin-1],catalog
+            ) else {continue;};
+            if !field.eq_ignore_ascii_case("dbparm") {continue;}
+            let Some(end)=((begin+1)..connect_idx).find(|&i|
+                matches!(lines[i].opcode,
+                    0x007f..=0x008c|0x0104..=0x0118|0x0159|
+                    0x0205|0x0207..=0x0209)
+            ) else {continue;};
+            found.push((connect.position,begin,end));
+        }
+        start=connect_idx+1;
+    }
+    found
+}
+
+fn print_dbparm_call_context(
+    lines:&[FlowInsn],sym:&FunctionSymbols,
+    catalog:&[SystemCatalogObject],
+) {
+    println!("=== DBPARM CALL CONTEXT (REDACTED, STATIC) ===");
+    println!("Only typed assignment sites, operation types, local names and call arities.");
+    println!("All literal values and raw operand bytes suppressed; no credential evaluation.");
+    println!("Lexical segments only; not proof of assignment execution on any branch.");
+    let assignments=dbparm_completed_assignments(lines,sym,catalog);
+    println!("Completed DBParm assignment candidates: {}",assignments.len());
+    for (connect,begin,end) in assignments {
+        let region=&lines[begin..=end];
+        println!("\nCONNECT 0x{connect:04X} DBParm assignment 0x{:04X}..0x{:04X}:",
+            lines[begin].position,lines[end].position);
+        println!("  Instructions: {}; string literals: {}; integer constants: {}",
+            region.len(),
+            region.iter().filter(|x|x.opcode==0x003b).count(),
+            region.iter().filter(|x|x.opcode==0x0034).count());
+        let mut source_locals=std::collections::BTreeSet::new();
+        for ins in region {
+            if !matches!(ins.opcode,0x001e|0x0030|0x01a9|0x0150) {continue;}
+            let idx=flow_operand_word(&ins.operands,0);
+            if let Some(var)=sym.locals.get(idx) {
+                source_locals.insert(format!("local[{idx}] {}",gate_symbol_name(&var.name)));
+            }
+        }
+        println!("  Local reads (not values): {}",
+            if source_locals.is_empty() {"none".into()}
+            else {source_locals.into_iter().collect::<Vec<_>>().join(", ")});
+        let mut call_count=0usize;
+        for call in (begin+1)..end {
+            if lines[call].opcode!=0x01bc {continue;}
+            call_count+=1;
+            let function=referenced_function_at(sym,&lines[call])
+                .unwrap_or_else(||"system/object function".into());
+            let next=lines.get(call+1).filter(|v|v.opcode==0x01bd);
+            let arity=next.map(|v|flow_operand_word(&v.operands,2));
+            println!("  Function at 0x{:04X}: {} | immediate call arguments: {}",
+                lines[call].position,gate_symbol_name(&function),
+                arity.map(|n|n.to_string()).unwrap_or_else(||"unverified".into()));
+            println!("    Surrounding instructions (redacted):");
+            for ins in &lines[call.saturating_sub(9).max(begin+1)..=(call+2).min(end)] {
+                println!("      0x{:04X} 0x{:04X} {:<27} {}",
+                    ins.position,ins.opcode,opcode_action(ins.opcode),
+                    redacted_gate_instruction(sym,ins,false));
+            }
+        }
+        if call_count==0 {println!("  No referenced function pushes identified.");}
+    }
+}
+
 fn inspect_connection_sites(
     parser: &PblParser, name: &str, body_index: usize,
     system_catalog: Option<&[SystemCatalogObject]>, show_sensitive:bool,
@@ -3481,6 +3563,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_post_connect_sql_trace(&lines,&symbols,show_sensitive,catalog.as_deref());
         return Ok(());
     }
+    if args.first().map(|arg|arg=="--dbparm-call-context").unwrap_or(false) {
+        if args.len()!=4 {
+            return Err("usage: probe_pcode --dbparm-call-context <object.fun> <body_index> <catalog.grp>".into());
+        }
+        let body_index=args[2].parse::<usize>()?;
+        let parser=PblParser::new(EXE)?;
+        let entry=parser.entries().iter()
+            .find(|e|e.name.eq_ignore_ascii_case(&args[1]))
+            .ok_or_else(||format!("compiled entry not found: {}",args[1]))?;
+        let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+        let symbols=find_pcode_symbols(&data,body_index)?;
+        let lines=flow_instructions(&symbols.code)?;
+        let catalog=parse_system_objects(&std::fs::read(&args[3])?)?;
+        print_dbparm_call_context(&lines,&symbols,&catalog);
+        return Ok(());
+    }
     if args.first().map(|arg|arg=="--connect-map").unwrap_or(false) {
         if args.len()<2 || args.len()>4 {
             return Err("usage: probe_pcode --connect-map <object.fun> [body_index] [catalog.grp]".into());
@@ -3649,6 +3747,45 @@ mod semantic_probe_tests {
             Some((0x006a,0x00dc)));
         terminal.get_mut(&0x006a).unwrap().operands=vec![0xe8,0x00];
         assert_eq!(simple_structured_loop(&blocks,&terminal,blocks[1]),None);
+    }
+
+    #[test]
+    fn completed_dbparm_assignment_is_catalog_verified_and_connect_bounded() {
+        let mut stack_buffer=vec![0u8;18];
+        stack_buffer[8..12].copy_from_slice(&0xffffu32.to_le_bytes());
+        stack_buffer[12..14].copy_from_slice(&15u16.to_le_bytes());
+        let sym=FunctionSymbols {
+            code:Vec::new(),stack_buffer,
+            locals:vec![VariableSymbol {
+                name:"at_sql".into(),global_index:None,type_id:0x8000,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:vec!["transaction".into()],
+        };
+        let catalog=vec![SystemCatalogObject {
+            name:"transaction".into(),type_id:0x4084,parent_type:0xffff,
+            all_member_count:16,instance_fields:(0..16).map(|i|
+                if i==15 {"dbparm".into()} else {format!("p{i}")}).collect(),
+            function_definitions:Vec::new(),
+        }];
+        let lines=vec![
+            FlowInsn {position:0,end:4,opcode:0x0030,operands:vec![0,0]},
+            FlowInsn {position:4,end:10,opcode:0x0020,operands:vec![8,0,0,0]},
+            FlowInsn {position:10,end:14,opcode:0x0122,operands:vec![0,0]},
+            FlowInsn {position:14,end:20,opcode:0x003b,operands:vec![0,0,0,0]},
+            FlowInsn {position:20,end:22,opcode:0x0088,operands:vec![]},
+            FlowInsn {position:22,end:26,opcode:0x0030,operands:vec![0,0]},
+            FlowInsn {position:26,end:28,opcode:0x0005,operands:vec![]},
+            FlowInsn {position:28,end:30,opcode:0x0000,operands:vec![]},
+        ];
+        assert_eq!(dbparm_completed_assignments(&lines,&sym,&catalog),
+            vec![(26,2,4)]);
+        let mut without_end=lines.clone();
+        without_end[4].opcode=0x0139;
+        assert!(dbparm_completed_assignments(&without_end,&sym,&catalog).is_empty());
+        let mut without_catalog=catalog.clone();
+        without_catalog[0].instance_fields[15]="some_other_field".into();
+        assert!(dbparm_completed_assignments(&lines,&sym,&without_catalog).is_empty());
     }
 
     #[test]
