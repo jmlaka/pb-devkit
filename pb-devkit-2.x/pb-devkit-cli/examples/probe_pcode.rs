@@ -1692,8 +1692,34 @@ fn print_connection_input_origins(
         println!("  0x{:04X}: {} -> 0x{:04X} | fallthrough 0x{:04X}",
             ins.position,kind,dest,ins.end);
         if matches!(ins.opcode,0x0002|0x0003) {
-            println!("    Condition: {}",
-                redacted_entry_gate_predicate(lines,sym,ins.position));
+            let predicate=redacted_entry_gate_predicate(lines,sym,ins.position);
+            println!("    Condition: {predicate}");
+            // The generic single-block interpreter sometimes stops at an
+            // unsupported PB333 opcode. Surface the exact bounded block as
+            // metadata so its stack semantics can be studied separately.
+            if matches!(ins.position,0x0a94|0x0ada) &&
+                predicate.starts_with("<unresolved")
+            {
+                match gate_trace_block_start(lines,ins.position) {
+                    Some(begin)=>{
+                        let block=lines.iter().filter(|v|
+                            v.position>=begin && v.position<=ins.position
+                        ).collect::<Vec<_>>();
+                        println!("    Redacted predicate instructions 0x{begin:04X}..0x{:04X} ({}):",
+                            ins.position,block.len());
+                        if block.len()>64 {
+                            println!("      Block exceeds 64-instruction safety cap; omitted.");
+                        } else {
+                            for v in block {
+                                let label=redacted_gate_instruction(sym,v,false);
+                                println!("      0x{:04X} 0x{:04X} {:<27} {}",
+                                    v.position,v.opcode,opcode_action(v.opcode),label);
+                            }
+                        }
+                    },
+                    None=>println!("    Predicate boundary unavailable."),
+                }
+            }
         }
         count+=1;
     }
@@ -1714,6 +1740,11 @@ fn print_connection_input_origins(
                 println!("  0x{:04X} 0x{:04X} {} | {}",
                     ins.position,ins.opcode,opcode_action(ins.opcode),
                     redacted_gate_instruction(sym,ins,false));
+                if ins.opcode==0x0020 {
+                    let member=flow_field_name(sym,&ins.operands);
+                    println!("    Member symbol: {}",
+                        gate_symbol_name(&member));
+                }
             }
         }
     }
