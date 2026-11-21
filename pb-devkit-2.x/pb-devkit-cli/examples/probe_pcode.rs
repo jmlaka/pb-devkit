@@ -1691,9 +1691,32 @@ fn print_connection_input_origins(
         let dest=flow_operand_word(&ins.operands,0);
         println!("  0x{:04X}: {} -> 0x{:04X} | fallthrough 0x{:04X}",
             ins.position,kind,dest,ins.end);
+        if matches!(ins.opcode,0x0002|0x0003) {
+            println!("    Condition: {}",
+                redacted_entry_gate_predicate(lines,sym,ins.position));
+        }
         count+=1;
     }
     if count==0 {println!("  No branch instructions in inspection window.");}
+    // Show the alternate-path block between the second branch's false
+    // destination and its convergence. These are opcode/symbol metadata
+    // only; no literal values or evaluated predicates.
+    if let Some(branch)=lines.iter().find(|ins|
+        ins.position==0x0ada && ins.opcode==0x0003
+    ) {
+        let other_start=flow_operand_word(&branch.operands,0);
+        let join=0x0b12usize;
+        if other_start<join && lines.iter().any(|ins|ins.position==join) {
+            println!("Alternate path 0x{other_start:04X}..0x{join:04X} (redacted instructions):");
+            for ins in lines.iter().filter(|ins|
+                ins.position>=other_start && ins.position<join
+            ).take(24) {
+                println!("  0x{:04X} 0x{:04X} {} | {}",
+                    ins.position,ins.opcode,opcode_action(ins.opcode),
+                    redacted_gate_instruction(sym,ins,false));
+            }
+        }
+    }
     println!("Assignment ordering is lexical, not proof of runtime reachability.");
 }
 
@@ -5340,6 +5363,29 @@ mod semantic_probe_tests {
         let args=call_argument_stack_sources(&seq,6,&sym,6,4).unwrap();
         assert_eq!(args[0],"<empty string literal>");
         assert_eq!(args[3],"g_connect_name");
+    }
+
+    #[test]
+    fn branch_condition_metadata_displays_source_without_literal() {
+        let sym=FunctionSymbols{
+            code:Vec::new(),stack_buffer:Vec::new(),
+            locals:vec![VariableSymbol{
+                name:"gs_verzia".into(),global_index:None,type_id:0x0006,
+            }],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mk=|position,opcode,operands:Vec<u8>|FlowInsn{
+            position,end:position+2+operands.len(),opcode,operands,
+        };
+        // A boolean condition made directly from an ordinary local.
+        let lines=vec![
+            mk(0,0x001e,vec![0,0]),
+            mk(4,0x0003,vec![20,0]),
+        ];
+        let expr=redacted_entry_gate_predicate(&lines,&sym,4);
+        assert_eq!(expr,"gs_verzia");
+        assert!(!expr.contains("password"));
     }
 
     #[test]
