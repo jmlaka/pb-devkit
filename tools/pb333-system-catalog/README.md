@@ -199,3 +199,31 @@ prefixes with their candidate \`ls_pom\` assignments. These are
 
 The global \`--show-sensitive\` option remains available for **local**
 inspection of compiled constants only. Do not share sensitive logs.
+
+
+## Correctly interpret ResetAssign in the post-CONNECT SQL buffer
+
+PbdViewer's \`ResetAssign\` duplicates the existing assignment target
+beneath the pending right-hand expression. In \`f_connect.fun\`, the
+\`0x05B0..0x061C\` assignment then performs a binary \`+\` before
+\`EndAssign\`: the SQL buffer is **appended to**, not simply overwritten.
+
+The \`--post-connect-sql\` report now recognizes this specific full
+opcode pattern, reports the count of appended compiled string literals
+(10 in the observed function), and distinguishes direct reads of the
+previous \`ls_pom\` from assignments without such reads. The pattern
+must match exactly before the report claims a verified append.
+
+Run a safe/redacted report:
+
+```bash
+cargo test -p pb-devkit-cli --example probe_pcode
+cargo run --release -p pb-devkit-cli --example probe_pcode -- \
+  --post-connect-sql f_connect.fun 0 /tmp/pb333_typedef.grp
+```
+
+For private inspection, add \`--show-sensitive\` at the end: the newly
+recognized append includes the concatenated compiled literal suffix,
+escaped as a terminal string. Keep that output local. Neither mode
+executes SQL; the final SQL command still requires verifying the
+earlier assignments, runtime substitution and the final \`Left()\` edit.
