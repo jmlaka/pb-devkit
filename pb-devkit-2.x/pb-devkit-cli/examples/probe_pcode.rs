@@ -2470,6 +2470,16 @@ fn print_post_connect_sql_trace(
                             println!("      Called function references: {}",
                                 functions.into_iter().collect::<Vec<_>>().join(", "));
                         }
+                        for ins in assignment {
+                            if ins.opcode!=0x003b {continue;}
+                            let Some(raw)=ins.operands.get(..4) else {continue;};
+                            let offset=u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+                            let Some(literal)=utf16_string(&sym.stack_buffer,offset) else {continue;};
+                            if let Some(class)=sql_literal_intent(&literal) {
+                                println!("      SQL-looking literal at 0x{:04X}: {class} (not final SQL)",
+                                    ins.position);
+                            }
+                        }
                     },
                     None=>println!("    BeginAssign at 0x{:04X}: no direct EndAssign found in block",
                         begin.position),
