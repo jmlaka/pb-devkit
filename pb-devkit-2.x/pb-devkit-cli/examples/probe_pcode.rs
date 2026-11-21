@@ -1668,6 +1668,70 @@ fn next_connect_endpoints(
     endpoints.into_iter().collect()
 }
 
+// Reachability before the first CONNECT (or RETURN), starting at function entry.
+// This deliberately stops at CONNECT; it never treats a later retry as an
+// independently selected entry path. Both unknown outcomes of conditional
+// jumps remain possible, and no runtime credential values are inspected.
+fn preconnect_branch_gates(lines:&[FlowInsn])
+    -> Vec<(usize,usize,Vec<String>,Vec<String>)>
+{
+    use std::collections::{BTreeMap,BTreeSet};
+    let by_offset:BTreeMap<usize,&FlowInsn>=lines.iter()
+        .map(|ins|(ins.position,ins)).collect();
+    let mut visited=BTreeSet::new();
+    let mut gates=Vec::new();
+    let mut todo=vec![0usize];
+    while let Some(offset)=todo.pop() {
+        if !visited.insert(offset) {continue;}
+        let Some(ins)=by_offset.get(&offset) else {continue;};
+        match ins.opcode {
+            0x0000|0x0001|0x0005 => {},
+            0x0004=>todo.push(flow_operand_word(&ins.operands,0)),
+            0x0002|0x0003=>{
+                let jump=flow_operand_word(&ins.operands,0);
+                let fall=ins.end;
+                let jumps=next_connect_endpoints(lines,jump);
+                let falls=next_connect_endpoints(lines,fall);
+                if jumps!=falls && (jumps.iter().chain(falls.iter())
+                    .any(|x|x.starts_with("CONNECT at ")))
+                {
+                    gates.push((ins.position,jump,jumps,falls));
+                }
+                todo.push(jump);
+                todo.push(fall);
+            }
+            _=>todo.push(ins.end),
+        }
+    }
+    gates.sort_by_key(|(offset,_,_,_)|*offset);
+    gates
+}
+
+fn print_preconnect_routing(lines:&[FlowInsn]) {
+    println!("\n=== CONNECT ENTRY ROUTING (STATIC, REDACTED) ===");
+    println!("Explores both outcomes of unknown conditions; stops at first CONNECT or RETURN.");
+    let endpoints=next_connect_endpoints(lines,0);
+    println!("First reachable operations from function entry: {}",
+        if endpoints.is_empty() {"<none>".to_string()} else {endpoints.join(", ")});
+    let gates=preconnect_branch_gates(lines);
+    if gates.is_empty() {
+        println!("No branch distinguishes first-connection destinations.");
+        return;
+    }
+    println!("Branch decisions that distinguish first CONNECT/RETURN destinations:");
+    for (offset,jump,jumps,falls) in gates.iter().take(40) {
+        println!("  Branch at 0x{offset:04X}:");
+        println!("    jump -> 0x{jump:04X}: {}",
+            if jumps.is_empty() {"<none>".to_string()} else {jumps.join(", ")});
+        println!("    fallthrough -> {}",
+            if falls.is_empty() {"<none>".to_string()} else {falls.join(", ")});
+    }
+    if gates.len()>40 {
+        println!("  {} further distinguishing branches omitted",gates.len()-40);
+    }
+    println!("Note: a branch's comparison is not reconstructed here; no literal values are printed.");
+}
+
 fn print_connection_control_flow(
     lines:&[FlowInsn], sym:&FunctionSymbols,
     catalog:Option<&[SystemCatalogObject]>,
@@ -1834,6 +1898,7 @@ fn inspect_connection_sites(
     println!("not necessarily the direct origin of a specific credential value.");
     println!("For exact data-flow, follow the property-assignment stack backwards.");
     print_connection_control_flow(&lines,&symbols,system_catalog,&connect_indices);
+    print_preconnect_routing(&lines);
     Ok(())
 }
 
@@ -2387,6 +2452,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+    #[test]
+    fn entry_routing_stops_at_first_connection_and_identifies_alternative_gates() {
+        let lines=vec![
+            FlowInsn {position:0,end:4,opcode:0x0003,operands:vec![20,0]},
+            FlowInsn {position:4,end:8,opcode:0x0002,operands:vec![12,0]},
+            FlowInsn {position:8,end:10,opcode:0x0005,operands:vec![]},
+            FlowInsn {position:10,end:12,opcode:0x0000,operands:vec![]},
+            FlowInsn {position:12,end:14,opcode:0x0005,operands:vec![]},
+            FlowInsn {position:14,end:16,opcode:0x0000,operands:vec![]},
+            FlowInsn {position:20,end:22,opcode:0x0005,operands:vec![]},
+            FlowInsn {position:22,end:24,opcode:0x0000,operands:vec![]},
+        ];
+        let entry=next_connect_endpoints(&lines,0);
+        assert_eq!(entry,vec![
+            "CONNECT at 0x0008".to_string(),
+            "CONNECT at 0x000C".to_string(),
+            "CONNECT at 0x0014".to_string(),
+        ]);
+        let gates=preconnect_branch_gates(&lines);
+        assert_eq!(gates.len(),2);
+        assert_eq!(gates[0].0,0);
+        assert_eq!(gates[1].0,4);
+        assert_eq!(gates[0].2,vec!["CONNECT at 0x0014".to_string()]);
+        assert_eq!(gates[1].2,vec!["CONNECT at 0x000C".to_string()]);
+    }
+
 
     #[test]
     fn sqlcode_guard_reconstructs_success_and_failure_for_not_equal() {
