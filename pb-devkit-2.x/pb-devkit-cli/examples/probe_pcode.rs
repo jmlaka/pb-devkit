@@ -1675,6 +1675,25 @@ fn print_connection_input_origins(
             println!("Variable {target}: not present in this body's resolved symbols.");
         }
     }
+    println!("Relevant branches near connection-name construction (not evaluated):");
+    let start=call_offset.saturating_sub(0x160);
+    let mut count=0usize;
+    for ins in lines.iter().filter(|ins|
+        ins.position>=start && ins.position<call_offset &&
+        matches!(ins.opcode,0x0002|0x0003|0x0004)
+    ) {
+        if count>=24 {println!("  Additional branch sites omitted.");break;}
+        let kind=match ins.opcode {
+            0x0002=>"conditional if true",
+            0x0003=>"conditional if false",
+            _=>"unconditional",
+        };
+        let dest=flow_operand_word(&ins.operands,0);
+        println!("  0x{:04X}: {} -> 0x{:04X} | fallthrough 0x{:04X}",
+            ins.position,kind,dest,ins.end);
+        count+=1;
+    }
+    if count==0 {println!("  No branch instructions in inspection window.");}
     println!("Assignment ordering is lexical, not proof of runtime reachability.");
 }
 
@@ -2730,6 +2749,29 @@ fn sql_assignment_expression_with_prior(
                     ));
                 }
                 stack.push(gate_symbol_name(&name).to_string());
+            },
+            0x0020|0x01d2=>{
+                // PbdViewer PushInstanceVariableName: the descriptor
+                // identifies the property; the following PushInstanceVariable
+                // combines it with the object already on the expression stack.
+                let name=flow_field_name(sym,&ins.operands);
+                if name.starts_with("field[") {
+                    return Err(format!(
+                        "unresolved object member descriptor at 0x{offset:04X}"
+                    ));
+                }
+                if name!="entryobject" && gate_symbol_name(&name)=="<unnamed>" {
+                    return Err(format!(
+                        "unsafe or unrecognized member name at 0x{offset:04X}"
+                    ));
+                }
+                stack.push(name);
+            },
+            0x0027|0x0141|0x0142|0x0186|0x01d0|0x021e=>{
+                let field=pop(&mut stack)?;
+                let object=pop(&mut stack)?;
+                if field=="entryobject" {stack.push(object);}
+                else {stack.push(format!("{object}.{field}"));}
             },
             0x003b=>{
                 let value=if show_sensitive {
@@ -5298,6 +5340,40 @@ mod semantic_probe_tests {
         let args=call_argument_stack_sources(&seq,6,&sym,6,4).unwrap();
         assert_eq!(args[0],"<empty string literal>");
         assert_eq!(args[3],"g_connect_name");
+    }
+
+    #[test]
+    fn local_assignment_expression_handles_instance_member_access() {
+        let sym=FunctionSymbols{
+            code:Vec::new(),
+            stack_buffer:vec![0;24],
+            locals:vec![
+                VariableSymbol{name:"ls_connection_name".into(),type_id:6,global_index:None},
+                VariableSymbol{name:"g_parent".into(),type_id:0x8001,global_index:Some(9)},
+            ],
+            globals:Vec::new(),referenced_functions:Vec::new(),
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mk=|position,opcode,operands:Vec<u8>|FlowInsn{
+            position,end:position+2+operands.len(),opcode,operands,
+        };
+        let mut lines=vec![
+            mk(0,0x011d,vec![0,0]),
+            mk(4,0x002f,vec![9,0]),
+            mk(8,0x0020,vec![1,0]), // entry-object marker, passthrough
+            mk(12,0x0027,vec![0,0]),
+            mk(16,0x0129,vec![0,0]),
+            mk(20,0x0088,vec![]),
+        ];
+        let refs=lines.iter().collect::<Vec<_>>();
+        assert_eq!(
+            sql_assignment_expression(&refs,&sym,None,false).unwrap(),
+            "ls_connection_name = g_parent"
+        );
+        lines[2].operands=vec![24,0];
+        assert!(sql_assignment_expression(
+            &lines.iter().collect::<Vec<_>>(),&sym,None,false
+        ).is_err());
     }
 
     #[test]
