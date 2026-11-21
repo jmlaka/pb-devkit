@@ -3608,6 +3608,45 @@ fn transaction_field_evidence(parser:&PblParser)
     Ok(())
 }
 
+// Index-ordered local symbol report without compiled literals, operand
+// values, connection strings or runtime data. PB local indices alone do
+// NOT prove formal argument order without signature metadata verification.
+fn local_variable_usage(
+    lines:&[FlowInsn],count:usize,
+) -> Vec<(usize,usize)> {
+    let mut usage=vec![(0usize,0usize);count];
+    for ins in lines {
+        let kind=match ins.opcode {
+            0x001e|0x0030|0x01a9|0x0150=>1u8,
+            0x011d|0x0120=>2u8,
+            _=>continue,
+        };
+        let index=flow_operand_word(&ins.operands,0);
+        if let Some((reads,begins))=usage.get_mut(index) {
+            if kind==1 {*reads+=1;} else {*begins+=1;}
+        }
+    }
+    usage
+}
+
+fn print_local_metadata_only(sym:&FunctionSymbols,lines:&[FlowInsn]) {
+    println!("=== FUNCTION LOCAL SYMBOL MAP (REDACTED) ===");
+    println!("Names, type IDs and read/write-begin counts only.");
+    println!("No literal values, raw operands, passwords, hashes or source strings.");
+    println!("Local index is not a formally verified argument position.");
+    let usage=local_variable_usage(lines,sym.locals.len());
+    println!("Local symbols: {}",sym.locals.len());
+    for (idx,symbol) in sym.locals.iter().enumerate().take(32) {
+        let (reads,begins)=usage[idx];
+        println!("  local[{idx}] {} : {} | reads={reads} begin-assigns={begins}",
+            gate_symbol_name(&symbol.name),
+            describe_type_id(symbol.type_id,&sym.type_names));
+    }
+    if sym.locals.len()>32 {
+        println!("  {} additional local symbols omitted",sym.locals.len()-32);
+    }
+}
+
 fn disassemble_one(
     parser: &PblParser,
     name: &str,
@@ -3703,6 +3742,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if args.len()!=1 {return Err("usage: probe_pcode --transaction-catalog".into());}
         let parser=PblParser::new(EXE)?;
         return transaction_catalog_scan(&parser);
+    }
+    if args.first().map(|arg|arg=="--function-locals").unwrap_or(false) {
+        if args.len()!=3 {
+            return Err("usage: probe_pcode --function-locals <object.fun> <body_index>".into());
+        }
+        let body_index=args[2].parse::<usize>()?;
+        let parser=PblParser::new(EXE)?;
+        let entry=parser.entries().iter()
+            .find(|e|e.name.eq_ignore_ascii_case(&args[1]))
+            .ok_or_else(||format!("compiled entry not found: {}",args[1]))?;
+        let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+        let symbols=find_pcode_symbols(&data,body_index)?;
+        let lines=flow_instructions(&symbols.code)?;
+        println!("Entry: {} | body: {}",entry.name,body_index);
+        print_local_metadata_only(&symbols,&lines);
+        return Ok(());
     }
     if args.first().map(|arg|arg=="--connect-gate-trace").unwrap_or(false) {
         if args.len()!=3 {
@@ -3923,6 +3978,20 @@ mod semantic_probe_tests {
         assert_eq!(simple_structured_loop(&blocks,&terminal,blocks[1]),None);
     }
 
+
+    #[test]
+    fn local_usage_report_only_counts_direct_reads_and_assignment_begins() {
+        let lines=vec![
+            FlowInsn {position:0,end:4,opcode:0x001e,operands:vec![0,0]},
+            FlowInsn {position:4,end:8,opcode:0x001e,operands:vec![0,0]},
+            FlowInsn {position:8,end:12,opcode:0x011d,operands:vec![1,0]},
+            FlowInsn {position:12,end:14,opcode:0x0088,operands:vec![]},
+            FlowInsn {position:14,end:18,opcode:0x0030,operands:vec![1,0]},
+            FlowInsn {position:18,end:20,opcode:0x0000,operands:vec![]},
+        ];
+        assert_eq!(local_variable_usage(&lines,3),
+            vec![(2,0),(1,1),(0,0)]);
+    }
 
     #[test]
     fn dbparm_heslo_args_only_identified_when_direct_literals_and_casts() {
