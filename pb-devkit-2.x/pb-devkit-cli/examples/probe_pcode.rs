@@ -1917,7 +1917,8 @@ fn gate_trace_block_start(lines:&[FlowInsn], branch_position:usize)
 
 fn print_redacted_gate_trace(lines:&[FlowInsn],sym:&FunctionSymbols,
     show_sensitive:bool) {
-    println!("=== CONNECT GATE INSTRUCTION DIAGNOSTICS (REDACTED) ===");
+    println!("=== CONNECT GATE INSTRUCTION DIAGNOSTICS ({}) ===",
+        if show_sensitive {"SENSITIVE LOCAL OUTPUT"} else {"REDACTED"});
     if show_sensitive {
         println!("SENSITIVE MODE: compiled literal values follow; keep output local.");
     } else {
@@ -1967,7 +1968,8 @@ fn print_redacted_gate_trace(lines:&[FlowInsn],sym:&FunctionSymbols,
 
 fn print_preconnect_routing(lines:&[FlowInsn], sym:&FunctionSymbols,
     show_sensitive:bool) {
-    println!("\n=== CONNECT ENTRY ROUTING (STATIC, REDACTED) ===");
+    println!("\n=== CONNECT ENTRY ROUTING (STATIC, {}) ===",
+        if show_sensitive {"SENSITIVE LOCAL OUTPUT"} else {"REDACTED"});
     println!("Explores both outcomes of unknown conditions; stops at first CONNECT or RETURN.");
     let endpoints=next_connect_endpoints(lines,0);
     println!("First reachable operations from function entry: {}",
@@ -2235,7 +2237,8 @@ fn print_transaction_assignment_paths(
 
 fn print_connect_return_map(lines:&[FlowInsn], sym:&FunctionSymbols,
     catalog:Option<&[SystemCatalogObject]>, show_sensitive:bool) {
-    println!("\n=== CONNECT RETURN CONTRACT (REDACTED STATIC TRACE) ===");
+    println!("\n=== CONNECT RETURN CONTRACT ({}) ===",
+        if show_sensitive {"SENSITIVE LOCAL OUTPUT"} else {"REDACTED STATIC TRACE"});
     println!("Reachable RETURN sites, nearby opcodes and conservative payload hints.");
     if show_sensitive {
         println!("SENSITIVE MODE: available compiled literals follow; runtime values still unknown.");
@@ -2306,7 +2309,8 @@ fn sql_literal_intent(literal:&str) -> Option<&'static str> {
 fn print_post_connect_sql_trace(
     lines:&[FlowInsn],sym:&FunctionSymbols,show_sensitive:bool,
 ) {
-    println!("=== POST-CONNECT DYNAMIC SQL TRACE (REDACTED) ===");
+    println!("=== POST-CONNECT DYNAMIC SQL TRACE ({}) ===",
+        if show_sensitive {"SENSITIVE LOCAL OUTPUT"} else {"REDACTED"});
     if show_sensitive {
         println!("SENSITIVE MODE: compiled literals shown where decoded. No SQL execution.");
     } else {
@@ -2464,7 +2468,8 @@ fn inspect_connection_sites(
     for (index,ins) in lines.iter().enumerate() {
         if ins.opcode==0x0005 {connect_indices.push(index);}
     }
-    println!("=== DB CONNECT PROVENANCE MAP (REDACTED) ===");
+    println!("=== DB CONNECT PROVENANCE MAP ({}) ===",
+        if show_sensitive {"SENSITIVE LOCAL OUTPUT"} else {"REDACTED"});
     println!("Entry: {} | body: {} | CONNECT sites: {}",
         entry.name,body_index,connect_indices.len());
     println!("Only property names, function names and instruction offsets.");
