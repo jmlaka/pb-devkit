@@ -1503,29 +1503,32 @@ fn compiled_function_name_matches(actual:&str, requested:&str) -> bool {
 }
 
 // Provenance for arguments of an immediate PB333 function call.
-// Reverse-slice only expressions supported by this minimal, verified
-// stack model. On unsupported code we report unresolved, never guess.
+// Reverse-slice only the last four argument expressions (args #3..#6).
+// The first two arguments can include by-reference transaction setup;
+// refusing to interpret them avoids blocking the independent string inputs.
+// On unsupported code within the selected tail we report unresolved.
 // Deliberately do not reveal compiled literal values (not even with
 // --show-sensitive): this mode is for input provenance, not credentials.
 fn call_argument_stack_sources(
     lines:&[FlowInsn],call_push_index:usize,sym:&FunctionSymbols,
-    expected_arity:usize,
+    expected_arity:usize,tail_arity:usize,
 ) -> Result<Vec<String>,String> {
     let push=lines.get(call_push_index).ok_or("call instruction index missing")?;
     let next=lines.get(call_push_index+1).ok_or("call execution instruction missing")?;
     if push.opcode!=0x01bc || next.opcode!=0x01bd ||
         flow_operand_word(&next.operands,2)!=expected_arity ||
-        expected_arity==0 || expected_arity>16
+        expected_arity==0 || expected_arity>16 ||
+        tail_arity==0 || tail_arity>expected_arity
     {return Err("expected adjacent function push and call with verified arity".into());}
-    let mut needed=expected_arity;
+    let mut needed=tail_arity;
     let mut start=None;
     let lower=call_push_index.saturating_sub(192);
     for i in (lower..call_push_index).rev() {
         let ins=&lines[i];
         let pop_count=match ins.opcode {
             0x001e|0x0030|0x01a9|0x0150|
-            0x002f|0x011f|0x0032..=0x003d|
-            0x01ff|0x0020|0x01bc => {
+            0x002f|0x011f|0x0153|0x0154|0x0174|0x01a6|0x0201|
+            0x0032..=0x003d|0x01ff|0x0020|0x01bc => {
                 if needed==0 {return Err("negative reverse stack demand".into());}
                 needed-=1;
                 0usize
@@ -1568,6 +1571,8 @@ fn call_argument_stack_sources(
             },
             0x0032..=0x003a|0x003c|0x003d|0x01ff=>
                 stack.push("<other literal>".to_string()),
+            0x002f|0x011f|0x0153|0x0154|0x0174|0x01a6|0x0201=>
+                stack.push(flow_global(sym,&ins.operands)),
             _=>{
                 if flow_statement(ins,sym,&mut stack,false).is_some() {
                     return Err(format!("unexpected statement within argument slice at 0x{:04X}",ins.position));
@@ -1576,7 +1581,7 @@ fn call_argument_stack_sources(
         }
         if stack.len()>64 {return Err("argument stack exceeds 64 items".into());}
     }
-    if stack.len()!=expected_arity ||
+    if stack.len()!=tail_arity ||
         stack.iter().any(|x|x.contains("<missing")||x.contains("<invalid"))
     {return Err("argument stack not fully resolved".into());}
     Ok(stack)
@@ -1645,10 +1650,10 @@ fn scan_compiled_function_callers(
                     if arity!=Some(6) {
                         println!("  Arg provenance unresolved: six-argument call not verified");
                     } else {
-                        match call_argument_stack_sources(&lines,i,&symbols,6) {
+                        match call_argument_stack_sources(&lines,i,&symbols,6,4) {
                             Ok(args)=>{
                                 for (argno,label) in [(3usize,"as_promis_ini"),(6usize,"as_conname")] {
-                                    let value=&args[argno-1];
+                                    let value=&args[argno-3];
                                     if value.len()>300 {
                                         println!("  arg #{argno} ({label}): expression too complex to display");
                                     } else {
@@ -5124,12 +5129,51 @@ mod semantic_probe_tests {
             mk(34,0x01bc,vec![0,0,1,0x80]),
             mk(40,0x01bd,vec![0,0,6,0,0,0]),
         ];
-        let args=call_argument_stack_sources(&seq,6,&sym,6).unwrap();
-        assert_eq!(args.len(),6);
-        assert_eq!(args[2],"<empty string literal>");
-        assert_eq!(args[5],"my_conname");
-        seq[3].opcode=0x011d;
-        assert!(call_argument_stack_sources(&seq,6,&sym,6).is_err());
+        let args=call_argument_stack_sources(&seq,6,&sym,6,4).unwrap();
+        assert_eq!(args.len(),4);
+        assert_eq!(args[0],"<empty string literal>");
+        assert_eq!(args[3],"my_conname");
+        // An unsupported reference/assignment in arg #1 does not prevent
+        // examination of the independent trailing four arguments.
+        seq[0].opcode=0x0120;
+        assert_eq!(
+            call_argument_stack_sources(&seq,6,&sym,6,4).unwrap()[3],
+            "my_conname"
+        );
+        // But an unsupported operation inside the trailing arguments must
+        // refuse the trace rather than guess the source.
+        seq[3].opcode=0x0120;
+        assert!(call_argument_stack_sources(&seq,6,&sym,6,4).is_err());
+    }
+
+    #[test]
+    fn trailing_arguments_accept_pb333_global_push_01a6() {
+        let sym=FunctionSymbols{
+            code:Vec::new(),stack_buffer:vec![0;8],
+            locals:Vec::new(),
+            globals:vec![VariableSymbol{
+                name:"g_connect_name".to_string(),
+                global_index:Some(19),type_id:6,
+            }],
+            referenced_functions:vec!["f_connect".into()],
+            sql_pool:Vec::new(),type_names:Vec::new(),
+        };
+        let mk=|position:usize,opcode:u16,operands:Vec<u8>|FlowInsn{
+            position,end:position+2+operands.len(),opcode,operands,
+        };
+        let seq=vec![
+            mk(0,0x0120,vec![0,0]), // unsupported first-argument setup
+            mk(4,0x003b,vec![0;4]), // arg #2
+            mk(10,0x003b,vec![0;4]), // arg #3
+            mk(16,0x003b,vec![0;4]), // arg #4
+            mk(22,0x003b,vec![0;4]), // arg #5
+            mk(28,0x01a6,vec![19,0]), // arg #6
+            mk(32,0x01bc,vec![0,0,1,0x80]),
+            mk(38,0x01bd,vec![0,0,6,0,0,0]),
+        ];
+        let args=call_argument_stack_sources(&seq,6,&sym,6,4).unwrap();
+        assert_eq!(args[0],"<empty string literal>");
+        assert_eq!(args[3],"g_connect_name");
     }
 
     #[test]
