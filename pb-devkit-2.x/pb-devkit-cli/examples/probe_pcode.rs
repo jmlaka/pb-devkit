@@ -2214,6 +2214,178 @@ fn print_connect_return_map(lines:&[FlowInsn], sym:&FunctionSymbols,
     println!("prove semantic success, failure, or the origin of a stack value.");
 }
 
+// Report only statically validated SQL operation inputs and sanitized
+// instruction metadata. This is deliberately not a SQL decompiler: dynamic
+// concatenation, substitution and control flow can change the final query.
+fn is_sql_word_boundary(s:&str, prefix:&str) -> bool {
+    s.starts_with(prefix) && s[prefix.len()..].chars().next()
+        .map(|c|!c.is_ascii_alphanumeric() && c!='_')
+        .unwrap_or(true)
+}
+
+fn sql_literal_intent(literal:&str) -> Option<&'static str> {
+    let trimmed=literal.trim_start();
+    let ascii=trimmed.to_ascii_uppercase();
+    let text=ascii.as_str();
+    if is_sql_word_boundary(text,"SET") {
+        return Some("session-setting candidate (SET)");
+    }
+    if is_sql_word_boundary(text,"SELECT") || is_sql_word_boundary(text,"WITH") {
+        return Some("query-like prefix (SELECT/WITH)");
+    }
+    if ["INSERT","UPDATE","DELETE","MERGE"].iter()
+        .any(|p|is_sql_word_boundary(text,p)) {
+        return Some("potential data-changing DML");
+    }
+    if ["CREATE","ALTER","DROP","TRUNCATE"].iter()
+        .any(|p|is_sql_word_boundary(text,p)) {
+        return Some("potential schema-changing DDL");
+    }
+    if ["EXEC","EXECUTE","CALL","GRANT","REVOKE"].iter()
+        .any(|p|is_sql_word_boundary(text,p)) {
+        return Some("command/call/permissions prefix");
+    }
+    None
+}
+
+// Restrict the scan to the local contiguous block that contains EXECUTE
+// IMMEDIATE. The reified SQL is never printed. Even a recognized prefix is
+// only evidence from a literal, not a proven classification of the final SQL.
+fn print_post_connect_sql_trace(
+    lines:&[FlowInsn],sym:&FunctionSymbols,
+) {
+    println!("=== POST-CONNECT DYNAMIC SQL TRACE (REDACTED) ===");
+    println!("Static bytecode only: no SQL values, raw operands, secret literals or query execution.");
+    let sql_sites:Vec<usize>=lines.iter().enumerate()
+        .filter_map(|(idx,ins)|(ins.opcode==0x01c3).then_some(idx))
+        .collect();
+    println!("EXECUTE IMMEDIATE sites: {}",sql_sites.len());
+    for idx in sql_sites {
+        let sql=&lines[idx];
+        println!("\nSQL operation at 0x{:04X}:",sql.position);
+        let operands=idx.checked_sub(2)
+            .and_then(|j|lines.get(j..idx));
+        let src=match operands {
+            Some(pair) if pair.len()==2 &&
+                pair[0].opcode==0x001e &&
+                matches!(pair[1].opcode,0x001e|0x0030) =>
+            {
+                let source_idx=flow_operand_word(&pair[0].operands,0);
+                let tx_idx=flow_operand_word(&pair[1].operands,0);
+                let source=sym.locals.get(source_idx);
+                let tx=sym.locals.get(tx_idx);
+                match (source,tx) {
+                    (Some(v),Some(t))=>{
+                        println!("  SQL source: local[{source_idx}] {} ({})",
+                            gate_symbol_name(&v.name),
+                            describe_type_id(v.type_id,&sym.type_names));
+                        println!("  Transaction: local[{tx_idx}] {} ({})",
+                            gate_symbol_name(&t.name),
+                            describe_type_id(t.type_id,&sym.type_names));
+                        Some(source_idx)
+                    },
+                    _=>{
+                        println!("  SQL source or transaction local unresolved.");
+                        None
+                    }
+                }
+            },
+            _=>{
+                println!("  SQL source/transaction pattern not recognized; not guessing.");
+                None
+            }
+        };
+        let start=gate_trace_block_start(lines,sql.position).unwrap_or(0);
+        let block:Vec<&FlowInsn>=lines.iter()
+            .filter(|ins|ins.position>=start && ins.position<=sql.position)
+            .collect();
+        println!("  Local basic block 0x{start:04X}..0x{:04X}: {} instruction(s)",
+            sql.position,block.len());
+
+        // BeginAssignLocalVariable identifies a potential definition site.
+        // Only consider completed assignment sequences before the SQL opcode.
+        if let Some(source_idx)=src {
+            let mut begun=Vec::<usize>::new();
+            for (i,ins) in block.iter().enumerate() {
+                if matches!(ins.opcode,0x011d|0x0120) &&
+                    flow_operand_word(&ins.operands,0)==source_idx {
+                    begun.push(i);
+                }
+            }
+            println!("  BeginAssign sites for SQL source in this block: {}",begun.len());
+            for begin_idx in begun {
+                let begin=block[begin_idx];
+                // First EndAssign follows the BeginAssign; this is a
+                // candidate match, not a complete nested-stack proof.
+                let end_idx=((begin_idx+1)..block.len()).find(|&i|
+                    matches!(block[i].opcode,
+                       0x007f..=0x008c|0x0104..=0x0118|0x0159|0x0205|0x0207..=0x0209));
+                match end_idx {
+                    Some(end_idx)=>{
+                        println!("    Candidate assignment 0x{:04X}..0x{:04X}",
+                            begin.position,block[end_idx].position);
+                        let assignment=&block[begin_idx+1..end_idx];
+                        let mut functions=std::collections::BTreeSet::<String>::new();
+                        for ins in assignment {
+                            if ins.opcode==0x01bc {
+                                let index=flow_operand_word(&ins.operands,0);
+                                let owner=flow_operand_word(&ins.operands,2);
+                                if owner&0x8000!=0 {
+                                    if let Some(name)=sym.referenced_functions.get(index) {
+                                        functions.insert(gate_symbol_name(name).to_string());
+                                    }
+                                } else {
+                                    functions.insert("system function (name not resolved)".into());
+                                }
+                            }
+                        }
+                        if functions.is_empty() {
+                            println!("      Called function references: none identified");
+                        } else {
+                            println!("      Called function references: {}",
+                                functions.into_iter().collect::<Vec<_>>().join(", "));
+                        }
+                    },
+                    None=>println!("    BeginAssign at 0x{:04X}: no direct EndAssign found in block",
+                        begin.position),
+                }
+            }
+        }
+        // Look for a SQL-like beginning in string literals in this same
+        // basic block; never print their contents, not even partial values.
+        let mut candidates=std::collections::BTreeMap::<&str,usize>::new();
+        for ins in &block {
+            if ins.opcode!=0x003b {continue;}
+            let Some(raw)=ins.operands.get(..4) else {continue;};
+            let offset=u32::from_le_bytes([raw[0],raw[1],raw[2],raw[3]]);
+            let Some(literal)=utf16_string(&sym.stack_buffer,offset) else {continue;};
+            if let Some(class)=sql_literal_intent(&literal) {
+                *candidates.entry(class).or_insert(0)+=1;
+            }
+        }
+        if candidates.is_empty() {
+            println!("  Recognized SQL-looking literal prefixes: none (query remains unknown)");
+        } else {
+            println!("  SQL-looking literal prefixes in block (not final query classification):");
+            for (class,count) in candidates {
+                println!("    {class}: {count}");
+            }
+        }
+        println!("  Redacted instruction sequence:");
+        for ins in block.iter().rev().take(65).rev() {
+            println!("    0x{:04X} 0x{:04X} {:<27} {}",
+                ins.position,ins.opcode,opcode_action(ins.opcode),
+                redacted_gate_instruction(sym,ins));
+        }
+        if block.len()>65 {
+            println!("    {} earlier instruction(s) in this block omitted",
+                block.len()-65);
+        }
+    }
+    println!("\nWarning: a string-literal SQL prefix does not prove the final dynamic statement.");
+    println!("Read-only safety must be enforced by separate DB credentials/privileges.");
+}
+
 fn inspect_connection_sites(
     parser: &PblParser, name: &str, body_index: usize,
     system_catalog: Option<&[SystemCatalogObject]>,
@@ -2790,6 +2962,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_redacted_gate_trace(&lines,&symbols);
         return Ok(());
     }
+    if args.first().map(|arg|arg=="--post-connect-sql").unwrap_or(false) {
+        if args.len()!=3 {
+            return Err("usage: probe_pcode --post-connect-sql <object.fun> <body_index>".into());
+        }
+        let body_index=args[2].parse::<usize>()?;
+        let parser=PblParser::new(EXE)?;
+        let entry=parser.entries().iter()
+            .find(|e|e.name.eq_ignore_ascii_case(&args[1]))
+            .ok_or_else(||format!("compiled entry not found: {}",args[1]))?;
+        let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
+        let symbols=find_pcode_symbols(&data,body_index)?;
+        let lines=flow_instructions(&symbols.code)?;
+        print_post_connect_sql_trace(&lines,&symbols);
+        return Ok(());
+    }
     if args.first().map(|arg|arg=="--connect-map").unwrap_or(false) {
         if args.len()<2 || args.len()>4 {
             return Err("usage: probe_pcode --connect-map <object.fun> [body_index] [catalog.grp]".into());
@@ -2917,6 +3104,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod semantic_probe_tests {
     use super::*;
+
+    #[test]
+    fn sql_literal_classifier_only_reports_whitelisted_categories() {
+        assert_eq!(sql_literal_intent("  set option foo=bar"),
+            Some("session-setting candidate (SET)"));
+        assert_eq!(sql_literal_intent("select * from patients"),
+            Some("query-like prefix (SELECT/WITH)"));
+        assert_eq!(sql_literal_intent("update secret_table set x=1"),
+            Some("potential data-changing DML"));
+        assert_eq!(sql_literal_intent("CREATE VIEW v AS SELECT 1"),
+            Some("potential schema-changing DDL"));
+        assert_eq!(sql_literal_intent("set_password=something"),None);
+        assert_eq!(sql_literal_intent("password123"),None);
+        assert_eq!(sql_literal_intent(""),None);
+    }
+
 
     #[test]
     fn type_verified_transaction_sqlcode_return_has_no_secret_data() {
