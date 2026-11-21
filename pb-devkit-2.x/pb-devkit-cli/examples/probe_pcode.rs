@@ -3005,7 +3005,13 @@ fn disassemble_one(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Explicit opt-in for decoded compiled literals, accepted in any mode.
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let show_sensitive = args.iter().any(|arg|arg=="--show-sensitive");
+    args.retain(|arg|arg!="--show-sensitive");
+    if show_sensitive {
+        eprintln!("WARNING: --show-sensitive prints compiled literals locally. Do not share credentials or unredacted logs.");
+    }
     if args.first().map(|arg|arg=="--system-metadata").unwrap_or(false) {
         if args.len()!=2 {
             return Err("usage: probe_pcode --system-metadata /tmp/pb333_typedef.grp".into());
@@ -3036,7 +3042,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
         let symbols=find_pcode_symbols(&data,body_index)?;
         let lines=flow_instructions(&symbols.code)?;
-        print_redacted_gate_trace(&lines,&symbols);
+        print_redacted_gate_trace(&lines,&symbols,show_sensitive);
         return Ok(());
     }
     if args.first().map(|arg|arg=="--post-connect-sql").unwrap_or(false) {
@@ -3051,7 +3057,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let data=parser.parse_chunk_chain(entry.data_offset,entry.size)?;
         let symbols=find_pcode_symbols(&data,body_index)?;
         let lines=flow_instructions(&symbols.code)?;
-        print_post_connect_sql_trace(&lines,&symbols);
+        print_post_connect_sql_trace(&lines,&symbols,show_sensitive);
         return Ok(());
     }
     if args.first().map(|arg|arg=="--connect-map").unwrap_or(false) {
@@ -3064,7 +3070,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(parse_system_objects(&bytes)?)
         } else {None};
         let parser=PblParser::new(EXE)?;
-        return inspect_connection_sites(&parser,&args[1],index,catalog.as_deref());
+        return inspect_connection_sites(&parser,&args[1],index,catalog.as_deref(),show_sensitive);
     }
     if args.first().map(|arg|arg=="--db-scan").unwrap_or(false) {
         if args.len()!=1 {
@@ -3084,7 +3090,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .transpose()?.unwrap_or(0);
         let limit = args.get(2).map(|s| s.parse::<usize>())
             .transpose()?.unwrap_or(80).min(1000);
-        let show_strings = args.iter().skip(3).any(|s| s == "--strings");
+        let show_strings = show_sensitive || args.iter().skip(3).any(|s| s == "--strings");
         let show_flow = args.iter().skip(3).any(|s| s == "--flow");
         let show_structured = args.iter().skip(3).any(|s| s == "--structured");
         let show_sql_debug = args.iter().skip(3).any(|s| s == "--sql-debug");
@@ -3429,12 +3435,12 @@ mod semantic_probe_tests {
         };
         let numeric=FlowInsn {position:0,end:6,opcode:0x0034,
             operands:vec![0x39,0x30,0,0]};
-        let literal=redacted_gate_instruction(&sym,&numeric);
+        let literal=redacted_gate_instruction(&sym,&numeric,false);
         assert!(literal.contains("<redacted>"));
         assert!(!literal.contains("12345"));
         let unnamed=FlowInsn {position:6,end:10,opcode:0x0030,
             operands:vec![0x00,0x00]};
-        let description=redacted_gate_instruction(&sym,&unnamed);
+        let description=redacted_gate_instruction(&sym,&unnamed,false);
         assert!(description.contains("local[0]"));
         assert!(!description.contains("<variable#9>"));
         assert!(description.contains("primitive type"));
